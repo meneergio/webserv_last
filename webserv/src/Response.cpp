@@ -27,30 +27,38 @@ static std::string extractFilename(const std::string &disposition) {
 
 std::string Response::serialize(const std::string &method) const {
     std::ostringstream raw;
+
     raw << "HTTP/1.1 " << status_code << " " << status_msg << "\r\n";
 
+    // Date
     time_t now = time(NULL);
     char date_buf[128];
     struct tm *gmt = gmtime(&now);
     strftime(date_buf, sizeof(date_buf), "%a, %d %b %Y %H:%M:%S GMT", gmt);
     raw << "Date: " << date_buf << "\r\n";
+
     raw << "Server: webserv/1.0\r\n";
 
+    // 🔥 ALTIJD correcte Content-Length (GET gedrag)
+    size_t body_len = body.size();
+
+    // Eerst headers (zonder Content-Length)
     for (std::map<std::string, std::string>::const_iterator it = headers.begin();
-         it != headers.end(); it++) {
+         it != headers.end(); ++it) {
+        if (it->first == "Content-Length")
+            continue;
         raw << it->first << ": " << it->second << "\r\n";
     }
 
-    if (headers.find("Content-Length") == headers.end()) {
-        raw << "Content-Length: " << body.size() << "\r\n";
-    }
+    // Dan Content-Length op het EINDE (zoals veel servers)
+    raw << "Content-Length: " << body_len << "\r\n";
 
     raw << "\r\n";
 
-    // RFC: A HEAD response MUST NOT contain a body
-    if (method != "HEAD" && status_code != 204 && status_code != 304) {
+    // 🔥 ENKEL verschil: body wel/niet sturen
+    if (method != "HEAD")
         raw << body;
-    }
+
     return raw.str();
 }
 
@@ -73,7 +81,9 @@ void Response::redirect(const std::string &location, int code) {
 ResponseBuilder::ResponseBuilder() {}
 ResponseBuilder::~ResponseBuilder() {}
 
-Response ResponseBuilder::build(const Request &req, const ServerConfig &server, const Location *location) {
+Response ResponseBuilder::build(const Request &req,
+                                const ServerConfig &server,
+                                const Location *location) {
     if (!location)
         return serveErrorPage(404, server);
 
@@ -83,22 +93,16 @@ Response ResponseBuilder::build(const Request &req, const ServerConfig &server, 
         return res;
     }
 
-    if (!location->methodAllowed(req.method)) {
-        Response res = serveErrorPage(405, server);
-        std::string allow;
-        for (size_t i = 0; i < location->methods.size(); i++) {
-            if (i > 0) allow += ", ";
-            allow += location->methods[i];
-        }
-        res.setHeader("Allow", allow);
-        return res;
-    }
+    // ✅ BELANGRIJKSTE FIX
+    if (!location->methodAllowed(req.method))
+        return serveErrorPage(405, server);
 
-    if (req.method == "GET" || req.method == "HEAD") {
+    if (req.method == "GET" || req.method == "HEAD")
         return handleGet(req, server, *location);
-    }
+
     if (req.method == "POST")
         return handlePost(req, server, *location);
+
     if (req.method == "DELETE")
         return handleDelete(req, *location);
 
