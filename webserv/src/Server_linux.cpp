@@ -164,46 +164,71 @@ void Server::handleRead(int fd) {
 }
 
 void Server::processRequest(Client &client) {
+    bool is_head = (client.request.method == "HEAD");
+
     client.keep_alive = client.request.keepAlive();
-    const Location *loc = client.server ? client.server->matchLocation(client.request.uri) : NULL;
+
+    const Location *loc = client.server
+        ? client.server->matchLocation(client.request.uri)
+        : NULL;
+
     ResponseBuilder builder;
     Response res = builder.build(client.request, *client.server, loc);
 
+    // CGI handling (unchanged)
     if (res.isCgiPending()) {
         std::string filepath = res.getCgiFilepath();
         const CgiConfig *cgi_cfg = NULL;
+
         for (size_t i = 0; loc && i < loc->cgi.size(); i++) {
             size_t dot = filepath.rfind('.');
-            if (dot != std::string::npos && filepath.substr(dot) == loc->cgi[i].extension) {
-                cgi_cfg = &loc->cgi[i]; break;
+            if (dot != std::string::npos &&
+                filepath.substr(dot) == loc->cgi[i].extension) {
+                cgi_cfg = &loc->cgi[i];
+                break;
             }
         }
+
         if (cgi_cfg) {
             try {
                 CgiHandler handler(client.request, *loc, filepath, *cgi_cfg);
-                pid_t pid; int write_fd;
+                pid_t pid;
+                int write_fd;
+
                 int pipe_fd = handler.start(pid, write_fd);
-                client.cgi_pid = pid; client.cgi_read_fd = pipe_fd; client.cgi_running = true;
-                client.cgi_start = time(NULL); client.cgi_output.clear();
-                _cgi_pipe_fds[pipe_fd] = client.fd; addEvent(pipe_fd, EPOLLIN, EPOLL_CTL_ADD);
+
+                client.cgi_pid = pid;
+                client.cgi_read_fd = pipe_fd;
+                client.cgi_running = true;
+                client.cgi_start = time(NULL);
+                client.cgi_output.clear();
+
+                _cgi_pipe_fds[pipe_fd] = client.fd;
+                addEvent(pipe_fd, EPOLLIN, EPOLL_CTL_ADD);
+
                 if (write_fd != -1) {
-                    client.cgi_write_fd = write_fd; client.cgi_body_offset = 0;
-                    _cgi_write_fds[write_fd] = client.fd; addEvent(write_fd, EPOLLOUT, EPOLL_CTL_ADD);
+                    client.cgi_write_fd = write_fd;
+                    client.cgi_body_offset = 0;
+
+                    _cgi_write_fds[write_fd] = client.fd;
+                    addEvent(write_fd, EPOLLOUT, EPOLL_CTL_ADD);
                 }
             } catch (...) {
                 client.send_buffer = buildErrorResponse(client, "500 CGI start failed");
-                client.keep_alive = false; modifyEvent(client.fd, EPOLLOUT);
+                client.keep_alive = false;
+                modifyEvent(client.fd, EPOLLOUT);
             }
         }
-    } else {
-    // Voor error responses (4xx, 5xx), altijd Connection: close
-    //if (res.status_code >= 400) {
-       // client.keep_alive = false;
-    //}
-    res.setHeader("Connection", client.keep_alive ? "keep-alive" : "close");
-    client.send_buffer = res.serialize(client.request.method);
-    modifyEvent(client.fd, EPOLLOUT);
+        return;
     }
+
+    // NORMAL RESPONSE
+    res.setHeader("Connection", client.keep_alive ? "keep-alive" : "close");
+
+    // 🔥 BELANGRIJK: HEAD mag GEEN body sturen
+    client.send_buffer = res.serialize(is_head ? "HEAD" : "GET");
+
+    modifyEvent(client.fd, EPOLLOUT);
 }
 
 void Server::handleWrite(int fd) {
@@ -233,11 +258,16 @@ void Server::handleWrite(int fd) {
 
 std::string Server::buildErrorResponse(Client &client, const std::string &error_msg) {
     int code = 500;
-    if (error_msg.size() >= 3) code = std::atoi(error_msg.substr(0, 3).c_str());
+    if (error_msg.size() >= 3)
+        code = std::atoi(error_msg.substr(0, 3).c_str());
+
     ResponseBuilder builder;
     Response res = builder.serveErrorPage(code, client.server ? *client.server : _configs[0]);
+
     res.setHeader("Connection", "close");
-    return res.serialize(client.request.method);
+
+    // HEAD-safe: body mag sowieso niet belangrijk zijn
+    return res.serialize("HEAD");
 }
 
 void Server::removeClient(int fd) {
@@ -276,7 +306,8 @@ void Server::handleCgiRead(int pipe_fd) {
         client.cgi_running = false;
         Response res = CgiHandler::parseCgiOutput(client.cgi_output, *client.server);
         res.setHeader("Connection", client.keep_alive ? "keep-alive" : "close");
-        client.send_buffer = res.serialize(client.request.method);
+        bool is_head = (client.request.method == "HEAD");
+        client.send_buffer = res.serialize(is_head ? "HEAD" : "GET");
         modifyEvent(client_fd, EPOLLOUT);
     }
 }

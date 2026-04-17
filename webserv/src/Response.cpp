@@ -39,7 +39,7 @@ std::string Response::serialize(const std::string &method) const {
 
     raw << "Server: webserv/1.0\r\n";
 
-    // 🔥 ALTIJD correcte Content-Length (GET gedrag)
+    //  ALTIJD correcte Content-Length (GET gedrag)
     size_t body_len = body.size();
 
     // Eerst headers (zonder Content-Length)
@@ -55,7 +55,7 @@ std::string Response::serialize(const std::string &method) const {
 
     raw << "\r\n";
 
-    // 🔥 ENKEL verschil: body wel/niet sturen
+
     if (method != "HEAD")
         raw << body;
 
@@ -85,7 +85,18 @@ Response ResponseBuilder::build(const Request &req,
                                 const ServerConfig &server,
                                 const Location *location) {
     if (!location)
-        return serveErrorPage(404, server);
+    {
+        static Location fallback;
+        fallback.path = "/";
+        fallback.root = server.locations.empty() ? "." : server.locations[0].root;
+        fallback.methods.clear();
+        fallback.methods.push_back("GET");
+        fallback.methods.push_back("POST");
+        fallback.methods.push_back("DELETE");
+        fallback.directory_listing = false;
+        fallback.max_body_size = 1048576;
+        return handleGet(req, server, fallback);
+    }
 
     if (!location->redirect.empty()) {
         Response res;
@@ -94,11 +105,14 @@ Response ResponseBuilder::build(const Request &req,
     }
 
     // ✅ BELANGRIJKSTE FIX
-    if (!location->methodAllowed(req.method))
+    std::string method = req.method;
+
+
+    if (!location->methodAllowed(method))
         return serveErrorPage(405, server);
 
-    if (req.method == "GET" || req.method == "HEAD")
-        return handleGet(req, server, *location);
+    if (req.method == "GET")
+    return handleGet(req, server, *location);
 
     if (req.method == "POST")
         return handlePost(req, server, *location);
