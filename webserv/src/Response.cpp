@@ -47,7 +47,8 @@ std::string Response::serialize(const std::string &method) const {
 
     raw << "\r\n";
 
-    if (method != "HEAD" && status_code != 204) {
+    // RFC: A HEAD response MUST NOT contain a body
+    if (method != "HEAD" && status_code != 204 && status_code != 304) {
         raw << body;
     }
     return raw.str();

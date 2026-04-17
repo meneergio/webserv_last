@@ -81,9 +81,18 @@ size_t RequestParser::parse(Request &req, const std::string &data) {
 // Voorbeeld: "GET /index.html HTTP/1.1\r\n"
 
 bool RequestParser::parseRequestLine(Request &req, std::string &buffer) {
+    while (!buffer.empty() && (buffer[0] == '\r' || buffer[0] == '\n')) {
+        if (buffer[0] == '\r' && buffer.size() > 1 && buffer[1] == '\n')
+            buffer.erase(0, 2);
+        else
+            buffer.erase(0, 1);
+    }
+    
+    if (buffer.empty()) return false;
+
     size_t pos = buffer.find("\r\n");
     if (pos == std::string::npos)
-        return false;  // nog niet genoeg data
+        return false;
 
     std::string line = buffer.substr(0, pos);
     buffer.erase(0, pos + 2);

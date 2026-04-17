@@ -42,7 +42,7 @@ struct Client {
         : fd(-1)
         , server(NULL)
         , last_activity(0)
-        , keep_alive(false)
+        , keep_alive(true)
         , cgi_pid(-1)
         , cgi_read_fd(-1)
         , cgi_write_fd(-1)

@@ -138,6 +138,14 @@ void Server::handleRead(int fd) {
     if (!_clients.count(fd)) return;
     Client &client = _clients[fd];
     if (!client.send_buffer.empty()) return;
+    
+    // Als request al complete is en we niet keep-alive zijn, negeer data
+    if (client.request.isComplete() && !client.keep_alive) {
+        char buf[4096];
+        recv(fd, buf, sizeof(buf), 0);
+        return;
+    }
+    
     char buf[4096];
     ssize_t bytes = recv(fd, buf, sizeof(buf), 0);
     if (bytes <= 0) {
@@ -189,9 +197,9 @@ void Server::processRequest(Client &client) {
         }
     } else {
     // Voor error responses (4xx, 5xx), altijd Connection: close
-    if (res.status_code >= 400) {
-        client.keep_alive = false;
-    }
+    //if (res.status_code >= 400) {
+       // client.keep_alive = false;
+    //}
     res.setHeader("Connection", client.keep_alive ? "keep-alive" : "close");
     client.send_buffer = res.serialize(client.request.method);
     modifyEvent(client.fd, EPOLLOUT);
@@ -204,6 +212,7 @@ void Server::handleWrite(int fd) {
     if (client.send_buffer.empty()) {
         if (client.keep_alive) {
             client.request.reset();
+            client.parser.reset();  // Reset parser ook
             modifyEvent(fd, EPOLLIN);
         } else {
             removeClient(fd);
@@ -216,6 +225,10 @@ void Server::handleWrite(int fd) {
         removeClient(fd); return;
     }
     client.send_buffer.erase(0, bytes);
+    
+    if (client.send_buffer.empty() && !client.keep_alive) {
+        removeClient(fd);
+    }
 }
 
 std::string Server::buildErrorResponse(Client &client, const std::string &error_msg) {

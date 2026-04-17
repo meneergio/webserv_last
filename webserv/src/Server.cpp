@@ -211,38 +211,49 @@ void Server::handleNewConnection(int listen_fd) {
 
 // Data lezen van client
 
-void Server::handleRead(int fd) {
-    if (!_clients.count(fd))
-        return;
+vvoid Server::handleRead(int fd) {
+    if (!_clients.count(fd)) return;
 
     Client &client = _clients[fd];
-    char buf[4096];
+    char buf[8192];
 
     ssize_t bytes = recv(fd, buf, sizeof(buf), 0);
-
-    if (bytes == 0) { removeClient(fd); return; }
-    if (bytes < 0)  { removeClient(fd); return; }
+    if (bytes <= 0) { removeClient(fd); return; }
 
     client.last_activity = time(NULL);
-
     if (client.server)
         client.request.max_body_size = client.server->max_body_size;
 
+    // 1. Maak een string van de nieuwe data
     std::string data(buf, bytes);
-    client.parser.parse(client.request, data);
+    
+    // 2. Geef de data door bij de EERSTE aanroep van parse
+    bool first_call = true;
 
-    if (client.request.hasError()) {
-        client.send_buffer = buildErrorResponse(client, client.request.error_msg);
-        client.keep_alive  = false;
-        addEvent(fd, EVFILT_WRITE, EV_ADD);
-        deleteEvent(fd, EVFILT_READ);
-        return;
+    while (true) {
+        // Geef 'data' alleen de eerste keer mee, daarna lege strings 
+        // zodat de parser de overgebleven data in zijn interne buffer verwerkt.
+        client.parser.parse(client.request, first_call ? data : "");
+        first_call = false;
+
+        if (client.request.hasError()) {
+            client.send_buffer += buildErrorResponse(client, client.request.error_msg);
+            client.keep_alive = false;
+            addEvent(fd, EVFILT_WRITE, EV_ADD);
+            break;
+        }
+
+        if (client.request.isComplete()) {
+            processRequest(client);
+            // Als de verbinding gesloten moet worden (bijv. na error), stop de loop
+            if (!client.keep_alive || _clients.count(fd) == 0) break;
+            
+            // Belangrijk: De parser moet intern gereset zijn in processRequest 
+            // maar de resterende data in zijn buffer hebben behouden.
+            continue; 
+        }
+        break; 
     }
-
-    if (!client.request.isComplete())
-        return;
-
-    processRequest(client);
 }
 
 // ----------------------------------------
@@ -253,22 +264,27 @@ void Server::processRequest(Client &client) {
     const Request &req = client.request;
     int fd = client.fd;
 
-    std::cout << "Request fd=" << fd
-              << " " << req.method
-              << " " << req.uri << std::endl;
+    // Debugging: Altijd handig om te zien wat er binnenkomt tijdens de test
+    std::cout << "[DEBUG] Processing Request: fd=" << fd 
+              << " Method=" << req.method 
+              << " URI=" << req.uri << std::endl;
 
+    // 1. Connection bepalen (Belangrijk voor tester stabiliteit)
     client.keep_alive = req.keepAlive();
 
+    // 2. Host-based routing
     std::string host_header = req.getHeader("host");
     size_t colon = host_header.find(':');
     if (colon != std::string::npos)
         host_header = host_header.substr(0, colon);
+    
     if (!host_header.empty() && client.server) {
         ServerConfig *matched = matchServerByHost(host_header, client.server->port);
         if (matched)
             client.server = matched;
     }
 
+    // 3. Match Locatie
     const Location *loc = NULL;
     if (client.server)
         loc = client.server->matchLocation(req.uri);
@@ -276,6 +292,7 @@ void Server::processRequest(Client &client) {
     ResponseBuilder builder;
     Response res = builder.build(req, *client.server, loc);
 
+    // 4. CGI Logica
     if (res.isCgiPending() && loc) {
         std::string filepath = res.getCgiFilepath();
         const CgiConfig *cgi_cfg = NULL;
@@ -298,24 +315,35 @@ void Server::processRequest(Client &client) {
                 client.cgi_output.clear();
                 _cgi_pipe_fds[pipe_fd] = fd;
                 addEvent(pipe_fd, EVFILT_READ, EV_ADD);
-                return;
+                return; // CGI draait, we wachten op handleCgiRead
             } catch (const std::exception &e) {
-                client.send_buffer = buildErrorResponse(client, "500 CGI start failed");
+                client.send_buffer += buildErrorResponse(client, "500 CGI start failed");
                 client.keep_alive  = false;
             }
         } else {
-            client.send_buffer = buildErrorResponse(client, "500 No CGI config");
+            client.send_buffer += buildErrorResponse(client, "500 No CGI config");
             client.keep_alive  = false;
         }
     } else {
+        // 5. Normale Response (Static / Error)
+        // Zorg dat Connection header ALTIJD klopt voor de tester
         res.setHeader("Connection", client.keep_alive ? "keep-alive" : "close");
-        client.send_buffer = res.serialize();
+        
+        // CRUCIAAL 1: Gebruik += voor pipelining (meerdere requests in 1 keer)
+        // CRUCIAAL 2: Geef req.method mee zodat HEAD geen body stuurt!
+        client.send_buffer += res.serialize(req.method);
     }
 
-    client.request.reset();
-    client.parser = RequestParser();
+    // 6. Voorbereiden op het volgende request in de stream
+    // Dit zorgt dat de \n na een POST niet als een nieuw request-begin wordt gezien
+    client.request.reset(); 
+    
+    // Zorg dat je parser ook terug naar start-state gaat zonder de buffer te legen
+    // (Voeg deze methode toe aan je RequestParser als die er nog niet is)
+    // client.parser.resetStatusOnly(); 
+
+    // 7. Registreer voor write-event
     addEvent(fd, EVFILT_WRITE, EV_ADD);
-    deleteEvent(fd, EVFILT_READ);
 }
 
 // ----------------------------------------
