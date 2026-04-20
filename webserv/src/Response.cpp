@@ -103,7 +103,10 @@ Response ResponseBuilder::build(const Request &req,
         return res;
     }
 
-    if (!location->methodAllowed(req.method))
+    // HEAD is semantisch gelijk aan GET (RFC 7231 §4.3.2).
+    // Sta HEAD toe overal waar GET toegestaan is.
+    std::string check_method = (req.method == "HEAD") ? "GET" : req.method;
+    if (!location->methodAllowed(check_method))
         return serveErrorPage(405, server);
 
     if (req.method == "GET" || req.method == "HEAD")
