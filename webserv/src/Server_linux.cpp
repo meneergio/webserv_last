@@ -30,7 +30,8 @@ Server::~Server() {
         if (it->second.cgi_write_fd != -1) close(it->second.cgi_write_fd);
         close(it->first);
     }
-    for (std::map<int, int>::iterator it = _listen_fds.begin(); it != _listen_fds.end(); it++) close(it->first);
+    for (std::map<int, int>::iterator it = _listen_fds.begin(); it != _listen_fds.end(); it++)
+        close(it->first);
     if (_kq != -1) close(_kq);
 }
 
@@ -64,11 +65,14 @@ int Server::createSocket(const ServerConfig &config) {
     std::memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(config.port);
-    if (config.host == "0.0.0.0" || config.host.empty()) addr.sin_addr.s_addr = INADDR_ANY;
-    else inet_pton(AF_INET, config.host.c_str(), &addr.sin_addr);
+    if (config.host == "0.0.0.0" || config.host.empty())
+        addr.sin_addr.s_addr = INADDR_ANY;
+    else
+        inet_pton(AF_INET, config.host.c_str(), &addr.sin_addr);
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
         close(fd);
-        std::ostringstream ss; ss << "bind failed on " << config.host << ":" << config.port;
+        std::ostringstream ss;
+        ss << "bind failed on " << config.host << ":" << config.port;
         throw std::runtime_error(ss.str());
     }
     listen(fd, SOMAXCONN);
@@ -104,16 +108,16 @@ void Server::run() {
         for (int i = 0; i < n; i++) {
             int fd = events[i].data.fd;
             if (events[i].events & (EPOLLERR | EPOLLHUP)) {
-                if (_cgi_pipe_fds.count(fd)) handleCgiRead(fd);
+                if (_cgi_pipe_fds.count(fd))       handleCgiRead(fd);
                 else if (_cgi_write_fds.count(fd)) handleCgiWriteError(fd);
-                else if (_clients.count(fd)) removeClient(fd);
+                else if (_clients.count(fd))       removeClient(fd);
                 continue;
             }
-            if (_listen_fds.count(fd)) handleNewConnection(fd);
-            else if (_cgi_pipe_fds.count(fd)) handleCgiRead(fd);
-            else if (_cgi_write_fds.count(fd)) handleCgiWrite(fd);
-            else if (events[i].events & EPOLLIN) handleRead(fd);
-            else if (events[i].events & EPOLLOUT) handleWrite(fd);
+            if (_listen_fds.count(fd))             handleNewConnection(fd);
+            else if (_cgi_pipe_fds.count(fd))      handleCgiRead(fd);
+            else if (_cgi_write_fds.count(fd))     handleCgiWrite(fd);
+            else if (events[i].events & EPOLLIN)   handleRead(fd);
+            else if (events[i].events & EPOLLOUT)  handleWrite(fd);
         }
         checkTimeouts();
     }
@@ -123,50 +127,83 @@ void Server::handleNewConnection(int listen_fd) {
     int client_fd = accept(listen_fd, NULL, NULL);
     if (client_fd == -1) return;
     fcntl(client_fd, F_SETFL, O_NONBLOCK);
-        // TCP_NODELAY op client socket
     int nodelay = 1;
     setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
     Client client;
-    client.fd = client_fd;
-    client.server = matchServer(listen_fd);
+    client.fd            = client_fd;
+    client.server        = matchServer(listen_fd);
     client.last_activity = time(NULL);
-    _clients[client_fd] = client;
+    client.keep_alive    = true;
+    _clients[client_fd]  = client;
     addEvent(client_fd, EPOLLIN, EPOLL_CTL_ADD);
 }
 
+// handleRead: altijd lezen en bufferen in recv_buffer.
+// Verwerken alleen als send_buffer leeg is (geen pipelining conflict).
 void Server::handleRead(int fd) {
     if (!_clients.count(fd)) return;
     Client &client = _clients[fd];
-    if (!client.send_buffer.empty()) return;
-    
-    // Als request al complete is en we niet keep-alive zijn, negeer data
-    if (client.request.isComplete() && !client.keep_alive) {
-        char buf[4096];
-        recv(fd, buf, sizeof(buf), 0);
-        return;
-    }
-    
+
     char buf[4096];
     ssize_t bytes = recv(fd, buf, sizeof(buf), 0);
     if (bytes <= 0) {
-        if (bytes < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) return;
-        removeClient(fd); return;
+        if (bytes < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
+            return;
+        removeClient(fd);
+        return;
     }
     client.last_activity = time(NULL);
-    if (client.server) client.request.max_body_size = client.server->max_body_size;
-    client.parser.parse(client.request, std::string(buf, bytes));
+
+    // Altijd bufferen, ook als we nog aan het schrijven zijn
+    client.recv_buffer.append(buf, bytes);
+
+    // Nog bezig met schrijven van vorige response: wacht, data staat in recv_buffer
+    if (!client.send_buffer.empty())
+        return;
+
+    processBufferedRequests(client);
+}
+
+// processBufferedRequests: geef recv_buffer aan parser.
+// Parser bewaart zijn eigen interne buffer, dus aanroepen met ""
+// verwerkt ook data die al in de parser zat (pipelined requests).
+void Server::processBufferedRequests(Client &client) {
+    if (client.recv_buffer.empty()) return;
+    if (!client.server) return;
+
+    client.request.max_body_size = client.server->max_body_size;
+
+    // Parse recv_buffer (mag leeg zijn: parser verwerkt dan zijn interne buffer)
+    client.parser.parse(client.request, client.recv_buffer);
+    client.recv_buffer.clear();
+
     if (client.request.hasError()) {
         client.parser.reset();
         client.send_buffer = buildErrorResponse(client, client.request.error_msg);
-        client.keep_alive = false;
-        modifyEvent(fd, EPOLLOUT);
-    } else if (client.request.isComplete()) processRequest(client);
+        client.keep_alive  = false;
+        modifyEvent(client.fd, EPOLLOUT);
+        return;
+    }
+
+    if (client.request.isComplete()) {
+        processRequest(client);
+    }
 }
 
 void Server::processRequest(Client &client) {
     bool is_head = (client.request.method == "HEAD");
-
     client.keep_alive = client.request.keepAlive();
+
+    // Host-based server routing
+    std::string host_header = client.request.getHeader("host");
+    size_t colon = host_header.find(':');
+    if (colon != std::string::npos)
+        host_header = host_header.substr(0, colon);
+    if (!host_header.empty() && client.server) {
+        ServerConfig *matched = matchServerByHost(host_header, client.server->port);
+        if (matched)
+            client.server = matched;
+    }
 
     const Location *loc = client.server
         ? client.server->matchLocation(client.request.uri)
@@ -175,11 +212,10 @@ void Server::processRequest(Client &client) {
     ResponseBuilder builder;
     Response res = builder.build(client.request, *client.server, loc);
 
-    // CGI handling (unchanged)
+    // CGI
     if (res.isCgiPending()) {
         std::string filepath = res.getCgiFilepath();
         const CgiConfig *cgi_cfg = NULL;
-
         for (size_t i = 0; loc && i < loc->cgi.size(); i++) {
             size_t dot = filepath.rfind('.');
             if (dot != std::string::npos &&
@@ -188,103 +224,95 @@ void Server::processRequest(Client &client) {
                 break;
             }
         }
-
         if (cgi_cfg) {
             try {
                 CgiHandler handler(client.request, *loc, filepath, *cgi_cfg);
                 pid_t pid;
                 int write_fd;
-
                 int pipe_fd = handler.start(pid, write_fd);
-
-                client.cgi_pid = pid;
-                client.cgi_read_fd = pipe_fd;
-                client.cgi_running = true;
-                client.cgi_start = time(NULL);
+                client.cgi_pid         = pid;
+                client.cgi_read_fd     = pipe_fd;
+                client.cgi_running     = true;
+                client.cgi_start       = time(NULL);
                 client.cgi_output.clear();
-
                 _cgi_pipe_fds[pipe_fd] = client.fd;
                 addEvent(pipe_fd, EPOLLIN, EPOLL_CTL_ADD);
-
                 if (write_fd != -1) {
-                    client.cgi_write_fd = write_fd;
-                    client.cgi_body_offset = 0;
-
+                    client.cgi_write_fd      = write_fd;
+                    client.cgi_body_offset   = 0;
                     _cgi_write_fds[write_fd] = client.fd;
                     addEvent(write_fd, EPOLLOUT, EPOLL_CTL_ADD);
                 }
+                client.recv_buffer = client.parser.getBuffer();
+                client.request.reset();
+                client.parser.reset();
             } catch (...) {
                 client.send_buffer = buildErrorResponse(client, "500 CGI start failed");
-                client.keep_alive = false;
+                client.keep_alive  = false;
+                client.recv_buffer.clear();
+                client.request.reset();
+                client.parser.reset();
                 modifyEvent(client.fd, EPOLLOUT);
             }
+        } else {
+            client.send_buffer = buildErrorResponse(client, "500 No CGI config");
+            client.keep_alive  = false;
+            client.recv_buffer.clear();
+            client.request.reset();
+            client.parser.reset();
+            modifyEvent(client.fd, EPOLLOUT);
         }
         return;
     }
 
-    // NORMAL RESPONSE
     res.setHeader("Connection", client.keep_alive ? "keep-alive" : "close");
+    client.send_buffer = res.serialize(is_head ? "HEAD" : client.request.method);
 
-    // 🔥 BELANGRIJK: HEAD mag GEEN body sturen
-    client.send_buffer = res.serialize(is_head ? "HEAD" : "GET");
+    client.recv_buffer = client.parser.getBuffer();
 
+    client.request.reset();
+    client.parser.reset();
     modifyEvent(client.fd, EPOLLOUT);
 }
 
+// handleWrite: schrijf send_buffer naar client.
+// Na leegschrijven: verwerk pipelined data uit parser._buffer of recv_buffer.
 void Server::handleWrite(int fd) {
     if (!_clients.count(fd)) return;
     Client &client = _clients[fd];
+
     if (client.send_buffer.empty()) {
         if (client.keep_alive) {
-            client.request.reset();
-            client.parser.reset();  // Reset parser ook
-            modifyEvent(fd, EPOLLIN);
+            if (!client.recv_buffer.empty()) {
+                processBufferedRequests(client);
+            } else {
+                modifyEvent(fd, EPOLLIN);  // wacht op nieuwe data
+            }
         } else {
             removeClient(fd);
         }
         return;
     }
+
     ssize_t bytes = send(fd, client.send_buffer.c_str(), client.send_buffer.size(), 0);
     if (bytes < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return;
-        removeClient(fd); return;
+        removeClient(fd);
+        return;
     }
     client.send_buffer.erase(0, bytes);
-    
-    if (client.send_buffer.empty() && !client.keep_alive) {
-        removeClient(fd);
+
+    if (client.send_buffer.empty()) {
+        if (client.keep_alive) {
+            // Verwerk pipelined data die tijdens het schrijven binnenkwam
+            processBufferedRequests(client);
+            if (client.send_buffer.empty() && !client.cgi_running) {
+                modifyEvent(fd, EPOLLIN);
+            }
+        } else {
+            removeClient(fd);
+        }
     }
-}
-
-std::string Server::buildErrorResponse(Client &client, const std::string &error_msg) {
-    int code = 500;
-    if (error_msg.size() >= 3)
-        code = std::atoi(error_msg.substr(0, 3).c_str());
-
-    ResponseBuilder builder;
-    Response res = builder.serveErrorPage(code, client.server ? *client.server : _configs[0]);
-
-    res.setHeader("Connection", "close");
-
-    // HEAD-safe: body mag sowieso niet belangrijk zijn
-    return res.serialize("HEAD");
-}
-
-void Server::removeClient(int fd) {
-    if (!_clients.count(fd)) return;
-    Client &client = _clients[fd];
-    if (client.cgi_running) { kill(client.cgi_pid, SIGKILL); waitpid(client.cgi_pid, NULL, 0); }
-    if (client.cgi_read_fd != -1) {
-        epoll_ctl(_kq, EPOLL_CTL_DEL, client.cgi_read_fd, NULL);
-        close(client.cgi_read_fd); _cgi_pipe_fds.erase(client.cgi_read_fd);
-    }
-    if (client.cgi_write_fd != -1) {
-        epoll_ctl(_kq, EPOLL_CTL_DEL, client.cgi_write_fd, NULL);
-        close(client.cgi_write_fd); _cgi_write_fds.erase(client.cgi_write_fd);
-    }
-    epoll_ctl(_kq, EPOLL_CTL_DEL, fd, NULL);
-    close(fd);
-    _clients.erase(fd);
 }
 
 void Server::handleCgiRead(int pipe_fd) {
@@ -292,6 +320,7 @@ void Server::handleCgiRead(int pipe_fd) {
     int client_fd = _cgi_pipe_fds[pipe_fd];
     if (!_clients.count(client_fd)) return;
     Client &client = _clients[client_fd];
+
     char buf[4096];
     ssize_t bytes = read(pipe_fd, buf, sizeof(buf));
     if (bytes > 0) {
@@ -300,14 +329,17 @@ void Server::handleCgiRead(int pipe_fd) {
     } else {
         if (bytes < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
         epoll_ctl(_kq, EPOLL_CTL_DEL, pipe_fd, NULL);
-        close(pipe_fd); _cgi_pipe_fds.erase(pipe_fd);
+        close(pipe_fd);
+        _cgi_pipe_fds.erase(pipe_fd);
         client.cgi_read_fd = -1;
+
         waitpid(client.cgi_pid, NULL, 0);
+        client.cgi_pid     = -1;
         client.cgi_running = false;
+
         Response res = CgiHandler::parseCgiOutput(client.cgi_output, *client.server);
         res.setHeader("Connection", client.keep_alive ? "keep-alive" : "close");
-        bool is_head = (client.request.method == "HEAD");
-        client.send_buffer = res.serialize(is_head ? "HEAD" : "GET");
+        client.send_buffer = res.serialize("GET");
         modifyEvent(client_fd, EPOLLOUT);
     }
 }
@@ -317,23 +349,29 @@ void Server::handleCgiWrite(int write_fd) {
     int client_fd = _cgi_write_fds[write_fd];
     if (!_clients.count(client_fd)) return;
     Client &client = _clients[client_fd];
+
     size_t rem = client.request.body.size() - client.cgi_body_offset;
     if (rem == 0) {
         epoll_ctl(_kq, EPOLL_CTL_DEL, write_fd, NULL);
-        close(write_fd); _cgi_write_fds.erase(write_fd);
-        client.cgi_write_fd = -1; return;
+        close(write_fd);
+        _cgi_write_fds.erase(write_fd);
+        client.cgi_write_fd = -1;
+        return;
     }
-    ssize_t bytes = write(write_fd, client.request.body.c_str() + client.cgi_body_offset, rem);
+    ssize_t bytes = write(write_fd,
+        client.request.body.c_str() + client.cgi_body_offset, rem);
     if (bytes > 0) {
         client.cgi_body_offset += bytes;
         if (client.cgi_body_offset >= client.request.body.size()) {
             epoll_ctl(_kq, EPOLL_CTL_DEL, write_fd, NULL);
-            close(write_fd); _cgi_write_fds.erase(write_fd);
+            close(write_fd);
+            _cgi_write_fds.erase(write_fd);
             client.cgi_write_fd = -1;
         }
     } else if (bytes < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
         epoll_ctl(_kq, EPOLL_CTL_DEL, write_fd, NULL);
-        close(write_fd); _cgi_write_fds.erase(write_fd);
+        close(write_fd);
+        _cgi_write_fds.erase(write_fd);
         client.cgi_write_fd = -1;
     }
 }
@@ -341,24 +379,54 @@ void Server::handleCgiWrite(int write_fd) {
 void Server::handleCgiWriteError(int write_fd) {
     if (!_cgi_write_fds.count(write_fd)) return;
     epoll_ctl(_kq, EPOLL_CTL_DEL, write_fd, NULL);
-    close(write_fd); _cgi_write_fds.erase(write_fd);
+    close(write_fd);
+    _cgi_write_fds.erase(write_fd);
+}
+
+void Server::removeClient(int fd) {
+    if (!_clients.count(fd)) return;
+    Client &client = _clients[fd];
+    if (client.cgi_running) {
+        kill(client.cgi_pid, SIGKILL);
+        waitpid(client.cgi_pid, NULL, 0);
+    }
+    if (client.cgi_read_fd != -1) {
+        epoll_ctl(_kq, EPOLL_CTL_DEL, client.cgi_read_fd, NULL);
+        close(client.cgi_read_fd);
+        _cgi_pipe_fds.erase(client.cgi_read_fd);
+    }
+    if (client.cgi_write_fd != -1) {
+        epoll_ctl(_kq, EPOLL_CTL_DEL, client.cgi_write_fd, NULL);
+        close(client.cgi_write_fd);
+        _cgi_write_fds.erase(client.cgi_write_fd);
+    }
+    epoll_ctl(_kq, EPOLL_CTL_DEL, fd, NULL);
+    close(fd);
+    _clients.erase(fd);
 }
 
 void Server::checkTimeouts() {
     time_t now = time(NULL);
     std::vector<int> to_remove;
-    for (std::map<int, Client>::iterator it = _clients.begin(); it != _clients.end(); it++) {
+    for (std::map<int, Client>::iterator it = _clients.begin();
+         it != _clients.end(); it++) {
         if (it->second.cgi_running && now - it->second.cgi_start > CGI_TIMEOUT) {
             kill(it->second.cgi_pid, SIGKILL);
+            waitpid(it->second.cgi_pid, NULL, WNOHANG);
+            it->second.cgi_running = false;
             it->second.send_buffer = buildErrorResponse(it->second, "504 Gateway Timeout");
             modifyEvent(it->first, EPOLLOUT);
-        } else if (now - it->second.last_activity > TIMEOUT_SEC) to_remove.push_back(it->first);
+        } else if (now - it->second.last_activity > TIMEOUT_SEC) {
+            to_remove.push_back(it->first);
+        }
     }
-    for (size_t i = 0; i < to_remove.size(); i++) removeClient(to_remove[i]);
+    for (size_t i = 0; i < to_remove.size(); i++)
+        removeClient(to_remove[i]);
 }
 
 ServerConfig *Server::matchServer(int listen_fd) {
-    if (_listen_fds.count(listen_fd)) return &_configs[_listen_fds[listen_fd]];
+    if (_listen_fds.count(listen_fd))
+        return &_configs[_listen_fds[listen_fd]];
     return NULL;
 }
 
@@ -371,4 +439,15 @@ ServerConfig *Server::matchServerByHost(const std::string &host, int port) {
         }
     }
     return fallback;
+}
+
+std::string Server::buildErrorResponse(Client &client, const std::string &error_msg) {
+    int code = 500;
+    if (error_msg.size() >= 3)
+        code = std::atoi(error_msg.substr(0, 3).c_str());
+    ResponseBuilder builder;
+    Response res = builder.serveErrorPage(
+        code, client.server ? *client.server : _configs[0]);
+    res.setHeader("Connection", client.keep_alive ? "keep-alive" : "close");
+    return res.serialize("GET");
 }

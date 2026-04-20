@@ -84,8 +84,7 @@ ResponseBuilder::~ResponseBuilder() {}
 Response ResponseBuilder::build(const Request &req,
                                 const ServerConfig &server,
                                 const Location *location) {
-    if (!location)
-    {
+    if (!location) {
         static Location fallback;
         fallback.path = "/";
         fallback.root = server.locations.empty() ? "." : server.locations[0].root;
@@ -104,22 +103,15 @@ Response ResponseBuilder::build(const Request &req,
         return res;
     }
 
-    // ✅ BELANGRIJKSTE FIX
-    std::string method = req.method;
-
-
-    if (!location->methodAllowed(method))
+    if (!location->methodAllowed(req.method))
         return serveErrorPage(405, server);
 
-    if (req.method == "GET")
-    return handleGet(req, server, *location);
-
+    if (req.method == "GET" || req.method == "HEAD")
+        return handleGet(req, server, *location);
     if (req.method == "POST")
         return handlePost(req, server, *location);
-
     if (req.method == "DELETE")
         return handleDelete(req, *location);
-
     return serveErrorPage(501, server);
 }
 

@@ -211,7 +211,7 @@ void Server::handleNewConnection(int listen_fd) {
 
 // Data lezen van client
 
-vvoid Server::handleRead(int fd) {
+void Server::handleRead(int fd) {
     if (!_clients.count(fd)) return;
 
     Client &client = _clients[fd];

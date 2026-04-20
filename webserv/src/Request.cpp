@@ -148,7 +148,7 @@ bool RequestParser::parseHeaders(Request &req, std::string &buffer) {
             } else if (!cl.empty()) {
                 req.content_length = static_cast<size_t>(std::atoi(cl.c_str()));
                 if (req.content_length > req.max_body_size) {
-                    setError(req, "413 Request Entity Too Large");
+                    setError(req, "413 Payload Too Large");
                     return false;
                 }
                 req.state = (req.content_length > 0) ? PARSE_BODY : PARSE_COMPLETE;
@@ -221,7 +221,7 @@ bool RequestParser::parseChunked(Request &req, std::string &buffer) {
 
         // Check max body size
         if (req.body.size() + chunk_size > req.max_body_size) {
-            setError(req, "413 Request Entity Too Large");
+            setError(req, "413 Payload Too Large");
             return false;
         }
 

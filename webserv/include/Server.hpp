@@ -87,6 +87,7 @@ private:
 
     // Request verwerking
     void        processRequest(Client &client);
+    void processBufferedRequests(Client &client);
     std::string buildErrorResponse(Client &client, const std::string &error_msg);
 
     // Hulpfuncties
