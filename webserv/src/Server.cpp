@@ -264,10 +264,6 @@ void Server::processRequest(Client &client) {
     const Request &req = client.request;
     int fd = client.fd;
 
-    // Debugging: Altijd handig om te zien wat er binnenkomt tijdens de test
-    std::cout << "[DEBUG] Processing Request: fd=" << fd 
-              << " Method=" << req.method 
-              << " URI=" << req.uri << std::endl;
 
     // 1. Connection bepalen (Belangrijk voor tester stabiliteit)
     client.keep_alive = req.keepAlive();

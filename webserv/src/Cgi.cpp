@@ -55,24 +55,27 @@ int CgiHandler::start(pid_t &out_pid, int &out_write_fd) {
         close(out_pipe[0]);
         close(out_pipe[1]);
 
-        // Resolve BEIDE paden VOOR chdir
-        char abs_path[4096];
-        char abs_binary[4096];
 
-        if (realpath(_filepath.c_str(), abs_path) == NULL) {
-            write(STDOUT_FILENO, "Status: 404\r\n\r\n", 15);
-            exit(1);
-        }
+        // Resolve het CGI binary pad (dat MOET bestaan)
+        char abs_binary[4096];
         if (realpath(_cgi.binary.c_str(), abs_binary) == NULL) {
             write(STDOUT_FILENO, "Status: 500\r\n\r\n", 15);
             exit(1);
         }
 
-        std::string dir = getScriptDir();
-        if (chdir(dir.c_str()) == -1) {
-            write(STDOUT_FILENO, "Status: 500\r\n\r\n", 15);
-            exit(1);
+        // Voor het script pad: als het bestaat gebruiken we absolute, anders relatief
+        char abs_path[4096];
+        bool script_exists = (realpath(_filepath.c_str(), abs_path) != NULL);
+        if (!script_exists) {
+            // Bestand bestaat niet, maar dat is OK voor sommige CGI binaries.
+            // Kopieer gewoon het originele pad.
+            std::strncpy(abs_path, _filepath.c_str(), sizeof(abs_path) - 1);
+            abs_path[sizeof(abs_path) - 1] = '\0';
         }
+
+        std::string dir = getScriptDir();
+        // chdir mag falen (als de directory niet bestaat), dat is geen fout.
+        (void)chdir(dir.c_str());
 
         std::vector<std::string> env_vec = buildEnv();
         char **env = envToCharpp(env_vec);

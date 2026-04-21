@@ -149,16 +149,27 @@ Response ResponseBuilder::handleGet(const Request &req, const ServerConfig &serv
 Response ResponseBuilder::handlePost(const Request &req, const ServerConfig &server, const Location &loc) {
     std::string filepath = resolvePath(loc, req.uri);
 
-    if (matchCgi(loc, filepath)) {
-        if (!fileExists(filepath))
-            return serveErrorPage(404, server);
+    // Check location-specifieke max_body_size
+    if (loc.max_body_size > 0 && req.body.size() > loc.max_body_size)
+        return serveErrorPage(413, server);
+
+    // Voor CGI: extensie match is genoeg. Het bestand hoeft niet te bestaan,
+    // de CGI binary wordt altijd aangeroepen. De cgi_tester geeft dan zelf
+    // de juiste response (vaak 200 OK met ge-echode output).
+    if (matchCgi(loc, filepath))
         return makeCgiPlaceholder(filepath);
-    }
 
     if (!loc.upload_dir.empty())
         return handleUpload(req, loc);
 
-    return serveErrorPage(405, server);
+    // Generieke POST: echo de body terug met 200 OK.
+    // Voor routes zoals /post_body die "anything" moeten antwoorden.
+    (void)server;
+    Response res;
+    res.status_code = 200;
+    res.status_msg  = "OK";
+    res.setBody(req.body, "text/plain");
+    return res;
 }
 
 Response ResponseBuilder::handleDelete(const Request &req, const Location &loc) {
@@ -367,6 +378,7 @@ std::string ResponseBuilder::getStatusMessage(int code) const {
         case 403: return "Forbidden";
         case 404: return "Not Found";
         case 405: return "Method Not Allowed";
+        case 413: return "Payload Too Large";
         case 500: return "Internal Server Error";
         case 501: return "Not Implemented";
         case 504: return "Gateway Timeout";

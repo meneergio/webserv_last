@@ -287,7 +287,7 @@ void Server::handleWrite(int fd) {
             if (!client.recv_buffer.empty()) {
                 processBufferedRequests(client);
             } else {
-                modifyEvent(fd, EPOLLIN);  // wacht op nieuwe data
+                modifyEvent(fd, EPOLLIN);
             }
         } else {
             removeClient(fd);
@@ -305,12 +305,20 @@ void Server::handleWrite(int fd) {
 
     if (client.send_buffer.empty()) {
         if (client.keep_alive) {
-            // Verwerk pipelined data die tijdens het schrijven binnenkwam
             processBufferedRequests(client);
             if (client.send_buffer.empty() && !client.cgi_running) {
                 modifyEvent(fd, EPOLLIN);
             }
         } else {
+            // GRACEFUL CLOSE: stop writing, maar blijf nog even lezen
+            // zodat de client z'n upload kan voltooien zonder RST te krijgen.
+            shutdown(fd, SHUT_WR);
+            // Drain: lees en gooi weg wat de client nog stuurt
+            char drain[8192];
+            for (int i = 0; i < 1000; i++) {
+                ssize_t n = recv(fd, drain, sizeof(drain), MSG_DONTWAIT);
+                if (n <= 0) break;
+            }
             removeClient(fd);
         }
     }
