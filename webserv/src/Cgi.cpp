@@ -1,4 +1,5 @@
 #include "../include/Cgi.hpp"
+#include "../include/Response.hpp" 
 #include <stdexcept>
 #include <sstream>
 #include <cstring>
@@ -170,8 +171,15 @@ Response CgiHandler::parseCgiOutput(const std::string &raw_output,
 
         if (key == "Status") {
             res.status_code = std::atoi(value.c_str());
-            if (value.size() > 4)
-                res.status_msg = value.substr(4);
+            // Probeer de status message uit het value te halen (bv. "404 Not Found")
+            size_t sp = value.find(' ');
+            if (sp != std::string::npos && sp + 1 < value.size()) {
+                res.status_msg = value.substr(sp + 1);
+            } else {
+                // Geen message in de CGI output — gebruik standaard HTTP message
+                ResponseBuilder rb;
+                res.status_msg = rb.getStatusMessage(res.status_code);
+            }
         } else {
             res.headers[key] = value;
         }

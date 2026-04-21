@@ -43,6 +43,7 @@ public:
                             const ServerConfig &server);
 
     bool isCgiRequest(const Request &req, const Location &loc) const;
+    std::string getStatusMessage(int code) const;
 
 private:
     Response    handleGet(const Request &req,
@@ -65,7 +66,6 @@ private:
     std::string resolvePath(const Location &loc,
                             const std::string &uri) const;
     std::string getMimeType(const std::string &filepath) const;
-    std::string getStatusMessage(int code) const;
     bool        fileExists(const std::string &path) const;
     bool        isDirectory(const std::string &path) const;
     const CgiConfig *matchCgi(const Location &loc,

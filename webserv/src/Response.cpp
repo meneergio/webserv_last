@@ -105,8 +105,7 @@ Response ResponseBuilder::build(const Request &req,
 
     // HEAD is semantisch gelijk aan GET (RFC 7231 §4.3.2).
     // Sta HEAD toe overal waar GET toegestaan is.
-    std::string check_method = (req.method == "HEAD") ? "GET" : req.method;
-    if (!location->methodAllowed(check_method))
+    if (!location->methodAllowed(req.method))
         return serveErrorPage(405, server);
 
     if (req.method == "GET" || req.method == "HEAD")
@@ -150,8 +149,11 @@ Response ResponseBuilder::handleGet(const Request &req, const ServerConfig &serv
 Response ResponseBuilder::handlePost(const Request &req, const ServerConfig &server, const Location &loc) {
     std::string filepath = resolvePath(loc, req.uri);
 
-    if (matchCgi(loc, filepath))
+    if (matchCgi(loc, filepath)) {
+        if (!fileExists(filepath))
+            return serveErrorPage(404, server);
         return makeCgiPlaceholder(filepath);
+    }
 
     if (!loc.upload_dir.empty())
         return handleUpload(req, loc);

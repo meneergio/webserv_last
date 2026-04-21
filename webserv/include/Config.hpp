@@ -33,19 +33,11 @@ struct Location {
     {}
 
     bool methodAllowed(const std::string &method) const {
-        // HEAD is automatisch toegestaan als GET toegestaan is (RFC 7231)
-        if (method == "HEAD") {
-            for (size_t i = 0; i < methods.size(); i++) {
-                if (methods[i] == "GET")
-                    return true;
-            }
-            return false;
-        }
-        for (size_t i = 0; i < methods.size(); i++) {
-            if (methods[i] == method)
-                return true;
-        }
-        return false;
+    for (size_t i = 0; i < methods.size(); i++) {
+        if (methods[i] == method)
+            return true;
+    }
+    return false;
     }
 };
 

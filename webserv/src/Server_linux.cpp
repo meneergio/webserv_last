@@ -240,6 +240,7 @@ void Server::processRequest(Client &client) {
                 if (write_fd != -1) {
                     client.cgi_write_fd      = write_fd;
                     client.cgi_body_offset   = 0;
+                    client.cgi_body          = client.request.body;   // BEWAAR body vóór reset
                     _cgi_write_fds[write_fd] = client.fd;
                     addEvent(write_fd, EPOLLOUT, EPOLL_CTL_ADD);
                 }
@@ -350,29 +351,32 @@ void Server::handleCgiWrite(int write_fd) {
     if (!_clients.count(client_fd)) return;
     Client &client = _clients[client_fd];
 
-    size_t rem = client.request.body.size() - client.cgi_body_offset;
+    size_t rem = client.cgi_body.size() - client.cgi_body_offset;   // was: client.request.body
     if (rem == 0) {
         epoll_ctl(_kq, EPOLL_CTL_DEL, write_fd, NULL);
         close(write_fd);
         _cgi_write_fds.erase(write_fd);
         client.cgi_write_fd = -1;
+        client.cgi_body.clear();   // cleanup
         return;
     }
     ssize_t bytes = write(write_fd,
-        client.request.body.c_str() + client.cgi_body_offset, rem);
+        client.cgi_body.c_str() + client.cgi_body_offset, rem);    // was: client.request.body
     if (bytes > 0) {
         client.cgi_body_offset += bytes;
-        if (client.cgi_body_offset >= client.request.body.size()) {
+        if (client.cgi_body_offset >= client.cgi_body.size()) {    // was: client.request.body
             epoll_ctl(_kq, EPOLL_CTL_DEL, write_fd, NULL);
             close(write_fd);
             _cgi_write_fds.erase(write_fd);
             client.cgi_write_fd = -1;
+            client.cgi_body.clear();   // cleanup
         }
     } else if (bytes < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
         epoll_ctl(_kq, EPOLL_CTL_DEL, write_fd, NULL);
         close(write_fd);
         _cgi_write_fds.erase(write_fd);
         client.cgi_write_fd = -1;
+        client.cgi_body.clear();
     }
 }
 

@@ -15,8 +15,8 @@
 #endif
 
 #define MAX_EVENTS  64
-#define TIMEOUT_SEC 60  // client timeout in seconden
-#define CGI_TIMEOUT 5   // CGI timeout in seconden
+#define TIMEOUT_SEC 120  // client timeout in seconden
+#define CGI_TIMEOUT 120   // CGI timeout in seconden
 
 // Ruwe request/response buffers per client
 struct Client {
@@ -34,6 +34,7 @@ struct Client {
     int                 cgi_read_fd;    // read uiteinde van de CGI output pipe
     int                 cgi_write_fd;   // write uiteinde voor CGI stdin (async body write)
     size_t              cgi_body_offset; // hoeveel bytes al geschreven naar CGI stdin
+    std::string         cgi_body; 
     std::string         cgi_output;     // accumuleert CGI stdout
     bool                cgi_running;
     time_t              cgi_start;      // voor timeout detectie
