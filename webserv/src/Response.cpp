@@ -26,40 +26,38 @@ static std::string extractFilename(const std::string &disposition) {
 }
 
 std::string Response::serialize(const std::string &method) const {
-    std::ostringstream raw;
+    size_t body_len = body.size();
 
-    raw << "HTTP/1.1 " << status_code << " " << status_msg << "\r\n";
+    // Bouw headers los op (klein)
+    std::ostringstream hdrs;
+    hdrs << "HTTP/1.1 " << status_code << " " << status_msg << "\r\n";
 
-    // Date
     time_t now = time(NULL);
     char date_buf[128];
     struct tm *gmt = gmtime(&now);
     strftime(date_buf, sizeof(date_buf), "%a, %d %b %Y %H:%M:%S GMT", gmt);
-    raw << "Date: " << date_buf << "\r\n";
+    hdrs << "Date: " << date_buf << "\r\n";
+    hdrs << "Server: webserv/1.0\r\n";
 
-    raw << "Server: webserv/1.0\r\n";
-
-    //  ALTIJD correcte Content-Length (GET gedrag)
-    size_t body_len = body.size();
-
-    // Eerst headers (zonder Content-Length)
     for (std::map<std::string, std::string>::const_iterator it = headers.begin();
          it != headers.end(); ++it) {
         if (it->first == "Content-Length")
             continue;
-        raw << it->first << ": " << it->second << "\r\n";
+        hdrs << it->first << ": " << it->second << "\r\n";
     }
+    hdrs << "Content-Length: " << body_len << "\r\n\r\n";
 
-    // Dan Content-Length op het EINDE (zoals veel servers)
-    raw << "Content-Length: " << body_len << "\r\n";
+    std::string headers_str = hdrs.str();
 
-    raw << "\r\n";
-
+    // Final string: reserve exacte size, append losstaand
+    std::string result;
+    result.reserve(headers_str.size() + (method != "HEAD" ? body_len : 0));
+    result.append(headers_str);
 
     if (method != "HEAD")
-        raw << body;
+        result.append(body);
 
-    return raw.str();
+    return result;
 }
 
 void Response::setHeader(const std::string &key, const std::string &value) {

@@ -154,7 +154,26 @@ void Server::handleRead(int fd) {
     }
     client.last_activity = time(NULL);
 
-    // Altijd bufferen, ook als we nog aan het schrijven zijn
+    // Streaming CGI: stuur body bytes direct naar CGI pipe, niet naar recv_buffer
+    if (client.cgi_streaming && client.cgi_write_fd != -1) {
+        client.cgi_body.append(buf, bytes);
+        client.cgi_bytes_streamed += bytes;
+        if (client.cgi_bytes_streamed % 10000000 < 4096)
+             std::cerr << "[2] STREAMING " << client.cgi_bytes_streamed << "/" << client.cgi_body_total << std::endl;
+        if (client.cgi_bytes_streamed >= client.cgi_body_total)
+             std::cerr << "[3] STREAM_DONE " << client.cgi_bytes_streamed << "/" << client.cgi_body_total << std::endl;
+        struct epoll_event _ev;
+        std::memset(&_ev, 0, sizeof(_ev));
+        _ev.events = EPOLLOUT;
+        _ev.data.fd = client.cgi_write_fd;
+        if (epoll_ctl(_kq, EPOLL_CTL_MOD, client.cgi_write_fd, &_ev) == -1)
+            epoll_ctl(_kq, EPOLL_CTL_ADD, client.cgi_write_fd, &_ev);
+        if (client.cgi_bytes_streamed >= client.cgi_body_total) {
+            client.cgi_streaming = false;  // body compleet
+        }
+        return;
+    }
+
     client.recv_buffer.append(buf, bytes);
 
     // Nog bezig met schrijven van vorige response: wacht, data staat in recv_buffer
@@ -183,6 +202,71 @@ void Server::processBufferedRequests(Client &client) {
         client.keep_alive  = false;
         modifyEvent(client.fd, EPOLLOUT);
         return;
+    }
+
+    // Early CGI start: headers compleet maar body nog niet volledig ontvangen
+    if (!client.cgi_running
+        && client.request.state == PARSE_BODY
+        && client.request.content_length > 0) {
+        const Location *loc = client.server
+            ? client.server->matchLocation(client.request.uri) : NULL;
+        if (loc) {
+            std::string filepath = client.request.uri.substr(loc->path.size());
+            if (filepath.empty() || filepath[0] != '/') filepath = "/" + filepath;
+            filepath = loc->root + filepath;
+            const CgiConfig *cgi_cfg = NULL;
+            size_t dot = filepath.rfind('.');
+            if (dot != std::string::npos) {
+                std::string ext = filepath.substr(dot);
+                for (size_t i = 0; i < loc->cgi.size(); i++) {
+                    if (loc->cgi[i].extension == ext) {
+                        cgi_cfg = &loc->cgi[i];
+                        break;
+                    }
+                }
+            }
+            if (cgi_cfg) {
+                try {
+                    CgiHandler cgi(client.request, *loc, filepath, *cgi_cfg);
+                    pid_t pid; int write_fd;
+                    std::cerr << "[1] EARLY_CGI_START cl=" << client.request.content_length << std::endl;
+                    int read_fd = cgi.start(pid, write_fd);
+                    client.cgi_running  = true;
+                    client.cgi_pid      = pid;
+                    client.cgi_start    = time(NULL);
+                    client.cgi_read_fd  = read_fd;
+                    client.cgi_streaming       = true;
+                    client.cgi_bytes_streamed  = 0;
+                    _cgi_pipe_fds[read_fd] = client.fd;
+                    addEvent(read_fd, EPOLLIN, EPOLL_CTL_ADD);
+                    if (write_fd != -1) {
+                        client.cgi_write_fd = write_fd;
+                        // Dump wat de parser al heeft in cgi_body
+                        client.cgi_body.swap(client.request.body);
+                        client.cgi_bytes_streamed = client.cgi_body.size();
+                        _cgi_write_fds[write_fd] = client.fd;
+                        addEvent(write_fd, EPOLLOUT, EPOLL_CTL_ADD);
+                    }
+                    client.cgi_body_total = client.request.content_length;
+                    std::string leftover = client.parser.getBuffer();
+                    client.request.reset();
+                    client.parser.reset();
+                    client.recv_buffer.clear();
+                    // Eerste body bytes zaten in parser buffer, niet in request.body
+                    if (!leftover.empty()) {
+                        client.cgi_body.append(leftover);
+                        client.cgi_bytes_streamed += leftover.size();
+                        if (client.cgi_bytes_streamed >= client.cgi_body_total)
+                            client.cgi_streaming = false;
+                    }
+                } catch (...) {
+                    client.send_buffer = buildErrorResponse(client, "500 CGI start failed");
+                    client.keep_alive  = false;
+                    modifyEvent(client.fd, EPOLLOUT);
+                }
+                return;
+            }
+        }
     }
 
     if (client.request.isComplete()) {
@@ -240,7 +324,7 @@ void Server::processRequest(Client &client) {
                 if (write_fd != -1) {
                     client.cgi_write_fd      = write_fd;
                     client.cgi_body_offset   = 0;
-                    client.cgi_body          = client.request.body;   // BEWAAR body vóór reset
+                    client.cgi_body.swap(client.request.body);   // O(1) pointer swap ipv memcpy
                     _cgi_write_fds[write_fd] = client.fd;
                     addEvent(write_fd, EPOLLOUT, EPOLL_CTL_ADD);
                 }
@@ -267,7 +351,8 @@ void Server::processRequest(Client &client) {
     }
 
     res.setHeader("Connection", client.keep_alive ? "keep-alive" : "close");
-    client.send_buffer = res.serialize(is_head ? "HEAD" : client.request.method);
+    std::string serialized = res.serialize(is_head ? "HEAD" : client.request.method);
+    client.send_buffer.swap(serialized);
 
     client.recv_buffer = client.parser.getBuffer();
 
@@ -343,12 +428,15 @@ void Server::handleCgiRead(int pipe_fd) {
         client.cgi_read_fd = -1;
 
         waitpid(client.cgi_pid, NULL, 0);
+        std::cerr << "[5] CGI_DONE output=" << client.cgi_output.size() << std::endl;
         client.cgi_pid     = -1;
         client.cgi_running = false;
 
         Response res = CgiHandler::parseCgiOutput(client.cgi_output, *client.server);
+        std::string().swap(client.cgi_output);   // geef geheugen direct vrij (swap-with-empty truc)
         res.setHeader("Connection", client.keep_alive ? "keep-alive" : "close");
-        client.send_buffer = res.serialize("GET");
+        std::string serialized = res.serialize("GET");
+        client.send_buffer.swap(serialized);     // swap ipv kopie
         modifyEvent(client_fd, EPOLLOUT);
     }
 }
@@ -359,28 +447,34 @@ void Server::handleCgiWrite(int write_fd) {
     if (!_clients.count(client_fd)) return;
     Client &client = _clients[client_fd];
 
-    size_t rem = client.cgi_body.size() - client.cgi_body_offset;   // was: client.request.body
-    if (rem == 0) {
-        epoll_ctl(_kq, EPOLL_CTL_DEL, write_fd, NULL);
-        close(write_fd);
-        _cgi_write_fds.erase(write_fd);
-        client.cgi_write_fd = -1;
-        client.cgi_body.clear();   // cleanup
-        return;
-    }
-    ssize_t bytes = write(write_fd,
-        client.cgi_body.c_str() + client.cgi_body_offset, rem);    // was: client.request.body
-    if (bytes > 0) {
-        client.cgi_body_offset += bytes;
-        if (client.cgi_body_offset >= client.cgi_body.size()) {    // was: client.request.body
+    if (client.cgi_body.empty()) {
+        if (!client.cgi_streaming) {
             epoll_ctl(_kq, EPOLL_CTL_DEL, write_fd, NULL);
+            std::cerr << "[4] PIPE_CLOSE streaming=" << client.cgi_streaming << " body_remaining=" << client.cgi_body.size() << std::endl;
             close(write_fd);
             _cgi_write_fds.erase(write_fd);
             client.cgi_write_fd = -1;
-            client.cgi_body.clear();   // cleanup
+        } else {
+            // Nog data onderweg: tijdelijk uit epoll halen om busy-loop te vermijden.
+            // handleRead voegt hem terug toe zodra er data is.
+            epoll_ctl(_kq, EPOLL_CTL_DEL, write_fd, NULL);
+        }
+        return;
+    }
+
+    ssize_t bytes = write(write_fd, client.cgi_body.c_str(), client.cgi_body.size());
+    if (bytes > 0) {
+        client.cgi_body.erase(0, bytes);  // rolling buffer: verwijder wat verstuurd is
+        if (client.cgi_body.empty() && !client.cgi_streaming) {
+            epoll_ctl(_kq, EPOLL_CTL_DEL, write_fd, NULL);
+            std::cerr << "[4] PIPE_CLOSE streaming=" << client.cgi_streaming << " body_remaining=" << client.cgi_body.size() << std::endl;
+            close(write_fd);
+            _cgi_write_fds.erase(write_fd);
+            client.cgi_write_fd = -1;
         }
     } else if (bytes < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
         epoll_ctl(_kq, EPOLL_CTL_DEL, write_fd, NULL);
+        std::cerr << "[4] PIPE_CLOSE streaming=" << client.cgi_streaming << " body_remaining=" << client.cgi_body.size() << std::endl;
         close(write_fd);
         _cgi_write_fds.erase(write_fd);
         client.cgi_write_fd = -1;

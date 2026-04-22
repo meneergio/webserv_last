@@ -38,6 +38,10 @@ struct Client {
     std::string         cgi_output;     // accumuleert CGI stdout
     bool                cgi_running;
     time_t              cgi_start;      // voor timeout detectie
+    bool                cgi_streaming;      // Track if we are in streaming mode
+    size_t              cgi_bytes_streamed; // Bytes sent so far
+    size_t              cgi_body_total;     // Total expected Content-Length
+
 
     Client()
         : fd(-1)
@@ -50,6 +54,9 @@ struct Client {
         , cgi_body_offset(0)
         , cgi_running(false)
         , cgi_start(0)
+        , cgi_streaming(false)
+        , cgi_bytes_streamed(0)
+        , cgi_body_total(0)
     {}
 };
 
