@@ -147,8 +147,6 @@ void Server::handleRead(int fd) {
     char buf[4096];
     ssize_t bytes = recv(fd, buf, sizeof(buf), 0);
     if (bytes <= 0) {
-        if (bytes < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
-            return;
         removeClient(fd);
         return;
     }
@@ -158,10 +156,6 @@ void Server::handleRead(int fd) {
     if (client.cgi_streaming && client.cgi_write_fd != -1) {
         client.cgi_body.append(buf, bytes);
         client.cgi_bytes_streamed += bytes;
-        if (client.cgi_bytes_streamed % 10000000 < 4096)
-             std::cerr << "[2] STREAMING " << client.cgi_bytes_streamed << "/" << client.cgi_body_total << std::endl;
-        if (client.cgi_bytes_streamed >= client.cgi_body_total)
-             std::cerr << "[3] STREAM_DONE " << client.cgi_bytes_streamed << "/" << client.cgi_body_total << std::endl;
         struct epoll_event _ev;
         std::memset(&_ev, 0, sizeof(_ev));
         _ev.events = EPOLLOUT;
@@ -229,7 +223,6 @@ void Server::processBufferedRequests(Client &client) {
                 try {
                     CgiHandler cgi(client.request, *loc, filepath, *cgi_cfg);
                     pid_t pid; int write_fd;
-                    std::cerr << "[1] EARLY_CGI_START cl=" << client.request.content_length << std::endl;
                     int read_fd = cgi.start(pid, write_fd);
                     client.cgi_running  = true;
                     client.cgi_pid      = pid;
@@ -381,8 +374,7 @@ void Server::handleWrite(int fd) {
     }
 
     ssize_t bytes = send(fd, client.send_buffer.c_str(), client.send_buffer.size(), 0);
-    if (bytes < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return;
+    if (bytes <= 0) {
         removeClient(fd);
         return;
     }
@@ -395,15 +387,6 @@ void Server::handleWrite(int fd) {
                 modifyEvent(fd, EPOLLIN);
             }
         } else {
-            // GRACEFUL CLOSE: stop writing, maar blijf nog even lezen
-            // zodat de client z'n upload kan voltooien zonder RST te krijgen.
-            shutdown(fd, SHUT_WR);
-            // Drain: lees en gooi weg wat de client nog stuurt
-            char drain[8192];
-            for (int i = 0; i < 1000; i++) {
-                ssize_t n = recv(fd, drain, sizeof(drain), MSG_DONTWAIT);
-                if (n <= 0) break;
-            }
             removeClient(fd);
         }
     }
@@ -421,22 +404,20 @@ void Server::handleCgiRead(int pipe_fd) {
         client.cgi_output.append(buf, bytes);
         client.last_activity = time(NULL);
     } else {
-        if (bytes < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
         epoll_ctl(_kq, EPOLL_CTL_DEL, pipe_fd, NULL);
         close(pipe_fd);
         _cgi_pipe_fds.erase(pipe_fd);
         client.cgi_read_fd = -1;
 
         waitpid(client.cgi_pid, NULL, 0);
-        std::cerr << "[5] CGI_DONE output=" << client.cgi_output.size() << std::endl;
         client.cgi_pid     = -1;
         client.cgi_running = false;
 
         Response res = CgiHandler::parseCgiOutput(client.cgi_output, *client.server);
-        std::string().swap(client.cgi_output);   // geef geheugen direct vrij (swap-with-empty truc)
+        std::string().swap(client.cgi_output);
         res.setHeader("Connection", client.keep_alive ? "keep-alive" : "close");
         std::string serialized = res.serialize("GET");
-        client.send_buffer.swap(serialized);     // swap ipv kopie
+        client.send_buffer.swap(serialized);
         modifyEvent(client_fd, EPOLLOUT);
     }
 }
@@ -450,7 +431,6 @@ void Server::handleCgiWrite(int write_fd) {
     if (client.cgi_body.empty()) {
         if (!client.cgi_streaming) {
             epoll_ctl(_kq, EPOLL_CTL_DEL, write_fd, NULL);
-            std::cerr << "[4] PIPE_CLOSE streaming=" << client.cgi_streaming << " body_remaining=" << client.cgi_body.size() << std::endl;
             close(write_fd);
             _cgi_write_fds.erase(write_fd);
             client.cgi_write_fd = -1;
@@ -464,17 +444,15 @@ void Server::handleCgiWrite(int write_fd) {
 
     ssize_t bytes = write(write_fd, client.cgi_body.c_str(), client.cgi_body.size());
     if (bytes > 0) {
-        client.cgi_body.erase(0, bytes);  // rolling buffer: verwijder wat verstuurd is
+        client.cgi_body.erase(0, bytes);
         if (client.cgi_body.empty() && !client.cgi_streaming) {
             epoll_ctl(_kq, EPOLL_CTL_DEL, write_fd, NULL);
-            std::cerr << "[4] PIPE_CLOSE streaming=" << client.cgi_streaming << " body_remaining=" << client.cgi_body.size() << std::endl;
             close(write_fd);
             _cgi_write_fds.erase(write_fd);
             client.cgi_write_fd = -1;
         }
-    } else if (bytes < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+    } else {
         epoll_ctl(_kq, EPOLL_CTL_DEL, write_fd, NULL);
-        std::cerr << "[4] PIPE_CLOSE streaming=" << client.cgi_streaming << " body_remaining=" << client.cgi_body.size() << std::endl;
         close(write_fd);
         _cgi_write_fds.erase(write_fd);
         client.cgi_write_fd = -1;

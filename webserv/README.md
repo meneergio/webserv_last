@@ -4,12 +4,12 @@
 
 ## Description
 
-Webserv is an HTTP/1.1 server written in C++98, built from scratch without any external libraries. It handles multiple simultaneous clients using a non-blocking I/O event loop powered by `kqueue` (macOS). The server reads a configuration file inspired by NGINX syntax and supports static file serving, file uploads, directory listing, multiple ports, and CGI execution.
+Webserv is an HTTP/1.1 server written in C++98, built from scratch without any external libraries. It handles multiple simultaneous clients using a single non-blocking I/O event loop (`epoll` on Linux, `kqueue` on macOS — the Makefile picks the right implementation automatically). The server reads a configuration file inspired by NGINX syntax and supports static file serving, file uploads, directory listing, multiple ports, and CGI execution.
 
 ## Instructions
 
 **Requirements**
-- macOS
+- Linux or macOS
 - `c++` with C++98 support
 - `make`
 
@@ -74,7 +74,7 @@ server {
 
 ## Features
 
-- Non-blocking I/O with `kqueue`
+- Non-blocking I/O with a single `epoll` (Linux) or `kqueue` (macOS) event loop
 - Multiple servers and ports from a single config file
 - GET, POST, DELETE methods
 - Static file serving with correct MIME types
