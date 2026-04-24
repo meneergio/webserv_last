@@ -23,6 +23,7 @@ struct Client {
     int                 fd;
     std::string         recv_buffer;
     std::string         send_buffer;
+    size_t              send_offset;    // eerst nog niet verzonden byte in send_buffer
     ServerConfig        *server;
     time_t              last_activity;
     bool                keep_alive;
@@ -33,8 +34,8 @@ struct Client {
     pid_t               cgi_pid;
     int                 cgi_read_fd;    // read uiteinde van de CGI output pipe
     int                 cgi_write_fd;   // write uiteinde voor CGI stdin (async body write)
-    size_t              cgi_body_offset; // hoeveel bytes al geschreven naar CGI stdin
-    std::string         cgi_body; 
+    size_t              cgi_body_offset; // eerst nog niet verzonden byte in cgi_body
+    std::string         cgi_body;
     std::string         cgi_output;     // accumuleert CGI stdout
     bool                cgi_running;
     time_t              cgi_start;      // voor timeout detectie
@@ -45,6 +46,7 @@ struct Client {
 
     Client()
         : fd(-1)
+        , send_offset(0)
         , server(NULL)
         , last_activity(0)
         , keep_alive(true)
