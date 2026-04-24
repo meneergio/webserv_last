@@ -4,6 +4,7 @@
 #include "Request.hpp"
 #include "Config.hpp"
 #include "Response.hpp"
+#include <sys/types.h>
 #include <string>
 #include <map>
 
