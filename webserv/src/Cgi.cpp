@@ -112,16 +112,20 @@ int CgiHandler::start(pid_t &out_pid, int &out_write_fd) {
 
     out_pid = pid;
 
-    // Als er een body is, geef de write fd terug voor async schrijven
-    // Anders sluit de write fd meteen (EOF signaal)
-    if (!_req.body.empty()) {
+    // Open de write pipe altijd als er een body is of kan komen
+    // (Content-Length > 0 of chunked). Bij early CGI start is
+    // _req.body op dit moment nog leeg maar komt wel streamend binnen.
+    bool expect_body = !_req.body.empty()
+                    || _req.content_length > 0
+                    || _req.getHeader("transfer-encoding") == "chunked";
+    if (expect_body) {
         out_write_fd = in_pipe[1];
     } else {
         close(in_pipe[1]);
         out_write_fd = -1;
     }
 
-    return out_pipe[0];  // Server registreert deze fd in epoll voor lezen
+    return out_pipe[0];
 }
 
 // parseCgiOutput(): parset ruwe CGI stdout naar een Response
@@ -211,8 +215,13 @@ std::vector<std::string> CgiHandler::buildEnv() const {
     env.push_back("GATEWAY_INTERFACE=CGI/1.1");
     env.push_back("REDIRECT_STATUS=200");
 
+    // Bij early CGI start is _req.body nog leeg maar content_length > 0,
+    // dus we gebruiken content_length wanneer dat hoger is.
+    size_t cl_value = _req.body.size();
+    if (_req.content_length > cl_value)
+        cl_value = _req.content_length;
     std::ostringstream cl;
-    cl << _req.body.size();
+    cl << cl_value;
     env.push_back("CONTENT_LENGTH=" + cl.str());
 
     if (_req.method == "POST") {
