@@ -17,7 +17,9 @@
 #include <netinet/in.h>
 #include <csignal>
 
-// Constructor / Destructor
+// Compact een rolling buffer pas wanneer de offset groter is dan deze waarde.
+// Vermijdt O(n^2) memmove door erase(0, n) op grote bodies.
+static const size_t COMPACT_THRESHOLD = 64 * 1024;
 
 Server::Server(std::vector<ServerConfig> &configs)
     : _configs(configs)
@@ -35,6 +37,8 @@ Server::~Server() {
          it != _clients.end(); it++) {
         if (it->second.cgi_read_fd != -1)
             close(it->second.cgi_read_fd);
+        if (it->second.cgi_write_fd != -1)
+            close(it->second.cgi_write_fd);
         close(it->first);
     }
     for (std::map<int, int>::iterator it = _listen_fds.begin();
@@ -44,8 +48,6 @@ Server::~Server() {
     if (_kq != -1)
         close(_kq);
 }
-
-// Setup
 
 void Server::setupListenSockets() {
     for (size_t i = 0; i < _configs.size(); i++) {
@@ -59,14 +61,8 @@ void Server::setupListenSockets() {
                 break;
             }
         }
-        if (already_bound) {
-            std::cout << "Sharing socket for "
-                      << _configs[i].host << ":"
-                      << _configs[i].port
-                      << " (server_name: " << _configs[i].server_name << ")"
-                      << std::endl;
+        if (already_bound)
             continue;
-        }
 
         int fd = createSocket(_configs[i]);
         _listen_fds[fd] = static_cast<int>(i);
@@ -120,8 +116,6 @@ int Server::createSocket(const ServerConfig &config) {
     return fd;
 }
 
-// kqueue helpers
-
 void Server::addEvent(int fd, int filter, int flags) {
     struct kevent ev;
     EV_SET(&ev, fd, filter, flags, 0, 0, NULL);
@@ -139,11 +133,8 @@ void Server::modifyEvent(int fd, int filter) {
     (void)fd; (void)filter;
 }
 
-// Hoofd event loop
-
 void Server::run() {
     struct kevent events[MAX_EVENTS];
-    std::cout << "Server running..." << std::endl;
 
     while (true) {
         struct timespec timeout;
@@ -163,6 +154,8 @@ void Server::run() {
             if (events[i].flags & EV_ERROR) {
                 if (_cgi_pipe_fds.count(fd))
                     handleCgiRead(fd);
+                else if (_cgi_write_fds.count(fd))
+                    handleCgiWriteError(fd);
                 else if (_clients.count(fd))
                     removeClient(fd);
                 continue;
@@ -172,6 +165,8 @@ void Server::run() {
                 handleNewConnection(fd);
             } else if (_cgi_pipe_fds.count(fd)) {
                 handleCgiRead(fd);
+            } else if (_cgi_write_fds.count(fd)) {
+                handleCgiWrite(fd);
             } else if (events[i].filter == EVFILT_READ) {
                 handleRead(fd);
             } else if (events[i].filter == EVFILT_WRITE) {
@@ -182,8 +177,6 @@ void Server::run() {
         checkTimeouts();
     }
 }
-
-// Nieuwe verbinding
 
 void Server::handleNewConnection(int listen_fd) {
     struct sockaddr_in client_addr;
@@ -202,166 +195,240 @@ void Server::handleNewConnection(int listen_fd) {
     client.fd            = client_fd;
     client.server        = matchServer(listen_fd);
     client.last_activity = time(NULL);
-    client.keep_alive    = false;
+    client.keep_alive    = true;
     _clients[client_fd]  = client;
 
     addEvent(client_fd, EVFILT_READ, EV_ADD);
-    std::cout << "New connection: fd=" << client_fd << std::endl;
 }
-
-// Data lezen van client
 
 void Server::handleRead(int fd) {
     if (!_clients.count(fd)) return;
-
     Client &client = _clients[fd];
-    char buf[8192];
 
+    char buf[4096];
     ssize_t bytes = recv(fd, buf, sizeof(buf), 0);
-    if (bytes <= 0) { removeClient(fd); return; }
-
+    if (bytes <= 0) {
+        removeClient(fd);
+        return;
+    }
     client.last_activity = time(NULL);
-    if (client.server)
-        client.request.max_body_size = client.server->max_body_size;
 
-    // 1. Maak een string van de nieuwe data
-    std::string data(buf, bytes);
-    
-    // 2. Geef de data door bij de EERSTE aanroep van parse
-    bool first_call = true;
+    // Streaming CGI: stuur body bytes direct naar CGI pipe
+    if (client.cgi_streaming && client.cgi_write_fd != -1) {
+        client.cgi_body.append(buf, bytes);
+        client.cgi_bytes_streamed += bytes;
+        struct kevent ev;
+        EV_SET(&ev, client.cgi_write_fd, EVFILT_WRITE, EV_ADD | EV_ENABLE, 0, 0, NULL);
+        kevent(_kq, &ev, 1, NULL, 0, NULL);
+        if (client.cgi_bytes_streamed >= client.cgi_body_total)
+            client.cgi_streaming = false;
+        return;
+    }
 
-    while (true) {
-        // Geef 'data' alleen de eerste keer mee, daarna lege strings 
-        // zodat de parser de overgebleven data in zijn interne buffer verwerkt.
-        client.parser.parse(client.request, first_call ? data : "");
-        first_call = false;
+    client.recv_buffer.append(buf, bytes);
 
-        if (client.request.hasError()) {
-            client.send_buffer += buildErrorResponse(client, client.request.error_msg);
-            client.keep_alive = false;
-            addEvent(fd, EVFILT_WRITE, EV_ADD);
-            break;
+    if (client.send_offset < client.send_buffer.size())
+        return;
+
+    processBufferedRequests(client);
+}
+
+void Server::processBufferedRequests(Client &client) {
+    if (client.recv_buffer.empty()) return;
+    if (!client.server) return;
+
+    client.request.max_body_size = client.server->max_body_size;
+
+    client.parser.parse(client.request, client.recv_buffer);
+    client.recv_buffer.clear();
+
+    if (client.request.hasError()) {
+        client.parser.reset();
+        std::string err = buildErrorResponse(client, client.request.error_msg);
+        client.send_buffer.swap(err);
+        client.send_offset = 0;
+        client.keep_alive  = false;
+        addEvent(client.fd, EVFILT_WRITE, EV_ADD);
+        deleteEvent(client.fd, EVFILT_READ);
+        return;
+    }
+
+    // Early CGI start
+    if (!client.cgi_running
+        && client.request.state == PARSE_BODY
+        && client.request.content_length > 0) {
+        const Location *loc = client.server
+            ? client.server->matchLocation(client.request.uri) : NULL;
+        if (loc) {
+            std::string filepath = client.request.uri.substr(loc->path.size());
+            if (filepath.empty() || filepath[0] != '/') filepath = "/" + filepath;
+            filepath = loc->root + filepath;
+            const CgiConfig *cgi_cfg = NULL;
+            size_t dot = filepath.rfind('.');
+            if (dot != std::string::npos) {
+                std::string ext = filepath.substr(dot);
+                for (size_t i = 0; i < loc->cgi.size(); i++) {
+                    if (loc->cgi[i].extension == ext) {
+                        cgi_cfg = &loc->cgi[i];
+                        break;
+                    }
+                }
+            }
+            if (cgi_cfg) {
+                try {
+                    CgiHandler cgi(client.request, *loc, filepath, *cgi_cfg);
+                    pid_t pid; int write_fd;
+                    int read_fd = cgi.start(pid, write_fd);
+                    client.cgi_running         = true;
+                    client.cgi_pid             = pid;
+                    client.cgi_start           = time(NULL);
+                    client.cgi_read_fd         = read_fd;
+                    client.cgi_streaming       = true;
+                    client.cgi_bytes_streamed  = 0;
+                    client.cgi_body_offset     = 0;
+                    client.cgi_output.clear();
+                    _cgi_pipe_fds[read_fd] = client.fd;
+                    addEvent(read_fd, EVFILT_READ, EV_ADD);
+                    if (write_fd != -1) {
+                        client.cgi_write_fd = write_fd;
+                        client.cgi_body.swap(client.request.body);
+                        client.cgi_bytes_streamed = client.cgi_body.size();
+                        _cgi_write_fds[write_fd] = client.fd;
+                        addEvent(write_fd, EVFILT_WRITE, EV_ADD);
+                    }
+                    client.cgi_body_total = client.request.content_length;
+                    std::string leftover = client.parser.getBuffer();
+                    client.request.reset();
+                    client.parser.reset();
+                    client.recv_buffer.clear();
+                    if (!leftover.empty()) {
+                        client.cgi_body.append(leftover);
+                        client.cgi_bytes_streamed += leftover.size();
+                        if (client.cgi_bytes_streamed >= client.cgi_body_total)
+                            client.cgi_streaming = false;
+                    }
+                    deleteEvent(client.fd, EVFILT_READ);
+                } catch (...) {
+                    std::string err = buildErrorResponse(client, "500 CGI start failed");
+                    client.send_buffer.swap(err);
+                    client.send_offset = 0;
+                    client.keep_alive  = false;
+                    addEvent(client.fd, EVFILT_WRITE, EV_ADD);
+                }
+                return;
+            }
         }
+    }
 
-        if (client.request.isComplete()) {
-            processRequest(client);
-            // Als de verbinding gesloten moet worden (bijv. na error), stop de loop
-            if (!client.keep_alive || _clients.count(fd) == 0) break;
-            
-            // Belangrijk: De parser moet intern gereset zijn in processRequest 
-            // maar de resterende data in zijn buffer hebben behouden.
-            continue; 
-        }
-        break; 
+    if (client.request.isComplete()) {
+        processRequest(client);
     }
 }
 
-// ----------------------------------------
-// processRequest: bouw response of start CGI
-// ----------------------------------------
-
 void Server::processRequest(Client &client) {
-    const Request &req = client.request;
-    int fd = client.fd;
+    bool is_head = (client.request.method == "HEAD");
+    client.keep_alive = client.request.keepAlive();
 
-
-    // 1. Connection bepalen (Belangrijk voor tester stabiliteit)
-    client.keep_alive = req.keepAlive();
-
-    // 2. Host-based routing
-    std::string host_header = req.getHeader("host");
+    std::string host_header = client.request.getHeader("host");
     size_t colon = host_header.find(':');
     if (colon != std::string::npos)
         host_header = host_header.substr(0, colon);
-    
     if (!host_header.empty() && client.server) {
         ServerConfig *matched = matchServerByHost(host_header, client.server->port);
         if (matched)
             client.server = matched;
     }
 
-    // 3. Match Locatie
-    const Location *loc = NULL;
-    if (client.server)
-        loc = client.server->matchLocation(req.uri);
+    const Location *loc = client.server
+        ? client.server->matchLocation(client.request.uri)
+        : NULL;
 
     ResponseBuilder builder;
-    Response res = builder.build(req, *client.server, loc);
+    Response res = builder.build(client.request, *client.server, loc);
 
-    // 4. CGI Logica
-    if (res.isCgiPending() && loc) {
+    if (res.isCgiPending()) {
         std::string filepath = res.getCgiFilepath();
         const CgiConfig *cgi_cfg = NULL;
-        for (size_t i = 0; i < loc->cgi.size(); i++) {
+        for (size_t i = 0; loc && i < loc->cgi.size(); i++) {
             size_t dot = filepath.rfind('.');
-            if (dot != std::string::npos && filepath.substr(dot) == loc->cgi[i].extension) {
+            if (dot != std::string::npos &&
+                filepath.substr(dot) == loc->cgi[i].extension) {
                 cgi_cfg = &loc->cgi[i];
                 break;
             }
         }
         if (cgi_cfg) {
             try {
-                CgiHandler handler(req, *loc, filepath, *cgi_cfg);
+                CgiHandler handler(client.request, *loc, filepath, *cgi_cfg);
                 pid_t pid;
-                int pipe_fd = handler.start(pid);
-                client.cgi_pid      = pid;
-                client.cgi_read_fd  = pipe_fd;
-                client.cgi_running  = true;
-                client.cgi_start    = time(NULL);
+                int write_fd;
+                int pipe_fd = handler.start(pid, write_fd);
+                client.cgi_pid         = pid;
+                client.cgi_read_fd     = pipe_fd;
+                client.cgi_running     = true;
+                client.cgi_start       = time(NULL);
                 client.cgi_output.clear();
-                _cgi_pipe_fds[pipe_fd] = fd;
+                client.cgi_body_offset = 0;
+                _cgi_pipe_fds[pipe_fd] = client.fd;
                 addEvent(pipe_fd, EVFILT_READ, EV_ADD);
-                return; // CGI draait, we wachten op handleCgiRead
-            } catch (const std::exception &e) {
-                client.send_buffer += buildErrorResponse(client, "500 CGI start failed");
+                if (write_fd != -1) {
+                    client.cgi_write_fd = write_fd;
+                    client.cgi_body.swap(client.request.body);
+                    _cgi_write_fds[write_fd] = client.fd;
+                    addEvent(write_fd, EVFILT_WRITE, EV_ADD);
+                }
+                client.recv_buffer = client.parser.getBuffer();
+                client.request.reset();
+                client.parser.reset();
+                deleteEvent(client.fd, EVFILT_READ);
+                return;
+            } catch (...) {
+                std::string err = buildErrorResponse(client, "500 CGI start failed");
+                client.send_buffer.swap(err);
+                client.send_offset = 0;
                 client.keep_alive  = false;
+                client.recv_buffer.clear();
+                client.request.reset();
+                client.parser.reset();
+                addEvent(client.fd, EVFILT_WRITE, EV_ADD);
+                deleteEvent(client.fd, EVFILT_READ);
+                return;
             }
         } else {
-            client.send_buffer += buildErrorResponse(client, "500 No CGI config");
+            std::string err = buildErrorResponse(client, "500 No CGI config");
+            client.send_buffer.swap(err);
+            client.send_offset = 0;
             client.keep_alive  = false;
+            client.recv_buffer.clear();
+            client.request.reset();
+            client.parser.reset();
+            addEvent(client.fd, EVFILT_WRITE, EV_ADD);
+            deleteEvent(client.fd, EVFILT_READ);
+            return;
         }
-    } else {
-        // 5. Normale Response (Static / Error)
-        // Zorg dat Connection header ALTIJD klopt voor de tester
-        res.setHeader("Connection", client.keep_alive ? "keep-alive" : "close");
-        
-        // CRUCIAAL 1: Gebruik += voor pipelining (meerdere requests in 1 keer)
-        // CRUCIAAL 2: Geef req.method mee zodat HEAD geen body stuurt!
-        client.send_buffer += res.serialize(req.method);
     }
 
-    // 6. Voorbereiden op het volgende request in de stream
-    // Dit zorgt dat de \n na een POST niet als een nieuw request-begin wordt gezien
-    client.request.reset(); 
-    
-    // Zorg dat je parser ook terug naar start-state gaat zonder de buffer te legen
-    // (Voeg deze methode toe aan je RequestParser als die er nog niet is)
-    // client.parser.resetStatusOnly(); 
+    res.setHeader("Connection", client.keep_alive ? "keep-alive" : "close");
+    std::string serialized = res.serialize(is_head ? "HEAD" : client.request.method);
+    client.send_buffer.swap(serialized);
+    client.send_offset = 0;
 
-    // 7. Registreer voor write-event
-    addEvent(fd, EVFILT_WRITE, EV_ADD);
+    client.recv_buffer = client.parser.getBuffer();
+
+    client.request.reset();
+    client.parser.reset();
+    addEvent(client.fd, EVFILT_WRITE, EV_ADD);
+    deleteEvent(client.fd, EVFILT_READ);
 }
 
-// ----------------------------------------
-// handleCgiRead: lees CGI output via kqueue
-// ----------------------------------------
-
 void Server::handleCgiRead(int pipe_fd) {
-    if (!_cgi_pipe_fds.count(pipe_fd))
-        return;
-
+    if (!_cgi_pipe_fds.count(pipe_fd)) return;
     int client_fd = _cgi_pipe_fds[pipe_fd];
-    if (!_clients.count(client_fd)) {
-        deleteEvent(pipe_fd, EVFILT_READ);
-        close(pipe_fd);
-        _cgi_pipe_fds.erase(pipe_fd);
-        return;
-    }
-
+    if (!_clients.count(client_fd)) return;
     Client &client = _clients[client_fd];
+
     char buf[4096];
     ssize_t bytes = read(pipe_fd, buf, sizeof(buf));
-
     if (bytes > 0) {
         client.cgi_output.append(buf, bytes);
         client.last_activity = time(NULL);
@@ -377,53 +444,126 @@ void Server::handleCgiRead(int pipe_fd) {
     client.cgi_pid     = -1;
     client.cgi_running = false;
 
-    Response res = CgiHandler::parseCgiOutput(
-        client.cgi_output, *client.server);
+    Response res = CgiHandler::parseCgiOutput(client.cgi_output, *client.server);
+    std::string().swap(client.cgi_output);
     res.setHeader("Connection", client.keep_alive ? "keep-alive" : "close");
-    client.send_buffer = res.serialize();
-    client.request.reset();
-    client.parser = RequestParser();
-
+    std::string serialized = res.serialize("GET");
+    client.send_buffer.swap(serialized);
+    client.send_offset = 0;
     addEvent(client_fd, EVFILT_WRITE, EV_ADD);
-    deleteEvent(client_fd, EVFILT_READ);
 }
 
-// Response sturen
+void Server::handleCgiWrite(int write_fd) {
+    if (!_cgi_write_fds.count(write_fd)) return;
+    int client_fd = _cgi_write_fds[write_fd];
+    if (!_clients.count(client_fd)) return;
+    Client &client = _clients[client_fd];
+
+    size_t remaining = client.cgi_body.size() - client.cgi_body_offset;
+    if (remaining == 0) {
+        if (!client.cgi_streaming) {
+            deleteEvent(write_fd, EVFILT_WRITE);
+            close(write_fd);
+            _cgi_write_fds.erase(write_fd);
+            client.cgi_write_fd = -1;
+            client.cgi_body.clear();
+            client.cgi_body_offset = 0;
+        } else {
+            deleteEvent(write_fd, EVFILT_WRITE);
+            if (client.cgi_body_offset > COMPACT_THRESHOLD) {
+                client.cgi_body.erase(0, client.cgi_body_offset);
+                client.cgi_body_offset = 0;
+            }
+        }
+        return;
+    }
+
+    ssize_t bytes = write(write_fd,
+                          client.cgi_body.data() + client.cgi_body_offset,
+                          remaining);
+    if (bytes > 0) {
+        client.cgi_body_offset += bytes;
+        if (client.cgi_body_offset >= client.cgi_body.size() && !client.cgi_streaming) {
+            deleteEvent(write_fd, EVFILT_WRITE);
+            close(write_fd);
+            _cgi_write_fds.erase(write_fd);
+            client.cgi_write_fd = -1;
+            client.cgi_body.clear();
+            client.cgi_body_offset = 0;
+        } else if (client.cgi_body_offset > COMPACT_THRESHOLD) {
+            client.cgi_body.erase(0, client.cgi_body_offset);
+            client.cgi_body_offset = 0;
+        }
+    } else {
+        deleteEvent(write_fd, EVFILT_WRITE);
+        close(write_fd);
+        _cgi_write_fds.erase(write_fd);
+        client.cgi_write_fd = -1;
+        client.cgi_body.clear();
+        client.cgi_body_offset = 0;
+    }
+}
+
+void Server::handleCgiWriteError(int write_fd) {
+    if (!_cgi_write_fds.count(write_fd)) return;
+    deleteEvent(write_fd, EVFILT_WRITE);
+    close(write_fd);
+    _cgi_write_fds.erase(write_fd);
+}
 
 void Server::handleWrite(int fd) {
-    if (!_clients.count(fd))
-        return;
-
+    if (!_clients.count(fd)) return;
     Client &client = _clients[fd];
 
-    if (client.send_buffer.empty()) {
-        removeClient(fd);
-        return;
-    }
-
-    ssize_t bytes = send(fd, client.send_buffer.c_str(),
-                         client.send_buffer.size(), 0);
-
-    if (bytes < 0) {
-        removeClient(fd);
-        return;
-    }
-
-    client.send_buffer.erase(0, bytes);
-    client.last_activity = time(NULL);
-
-    if (client.send_buffer.empty()) {
+    size_t remaining = client.send_buffer.size() - client.send_offset;
+    if (remaining == 0) {
         if (client.keep_alive) {
-            client.recv_buffer.clear();
-            deleteEvent(fd, EVFILT_WRITE);
-            addEvent(fd, EVFILT_READ, EV_ADD);
+            client.send_buffer.clear();
+            client.send_offset = 0;
+            if (!client.recv_buffer.empty()) {
+                processBufferedRequests(client);
+            } else {
+                deleteEvent(fd, EVFILT_WRITE);
+                addEvent(fd, EVFILT_READ, EV_ADD);
+            }
         } else {
             removeClient(fd);
         }
+        return;
+    }
+
+    ssize_t bytes = send(fd,
+                         client.send_buffer.data() + client.send_offset,
+                         remaining, 0);
+    if (bytes <= 0) {
+        removeClient(fd);
+        return;
+    }
+    client.send_offset += bytes;
+    client.last_activity = time(NULL);
+
+    if (client.send_offset >= client.send_buffer.size()) {
+        client.send_buffer.clear();
+        client.send_offset = 0;
+        if (client.keep_alive) {
+            if (!client.recv_buffer.empty()) {
+                processBufferedRequests(client);
+                if (client.send_buffer.empty() && !client.cgi_running) {
+                    deleteEvent(fd, EVFILT_WRITE);
+                    addEvent(fd, EVFILT_READ, EV_ADD);
+                }
+            } else {
+                deleteEvent(fd, EVFILT_WRITE);
+                addEvent(fd, EVFILT_READ, EV_ADD);
+            }
+        } else {
+            removeClient(fd);
+        }
+    } else if (client.send_offset > COMPACT_THRESHOLD) {
+        client.send_buffer.erase(0, client.send_offset);
+        client.send_offset = 0;
     }
 }
-
-// Client verwijderen
 
 void Server::removeClient(int fd) {
     if (!_clients.count(fd))
@@ -440,16 +580,17 @@ void Server::removeClient(int fd) {
         close(client.cgi_read_fd);
         _cgi_pipe_fds.erase(client.cgi_read_fd);
     }
+    if (client.cgi_write_fd != -1) {
+        deleteEvent(client.cgi_write_fd, EVFILT_WRITE);
+        close(client.cgi_write_fd);
+        _cgi_write_fds.erase(client.cgi_write_fd);
+    }
 
     deleteEvent(fd, EVFILT_READ);
     deleteEvent(fd, EVFILT_WRITE);
     close(fd);
     _clients.erase(fd);
-
-    std::cout << "Connection closed: fd=" << fd << std::endl;
 }
-
-// Timeouts: clients én CGI processen
 
 void Server::checkTimeouts() {
     time_t now = time(NULL);
@@ -460,10 +601,8 @@ void Server::checkTimeouts() {
         Client &client = it->second;
 
         if (client.cgi_running && now - client.cgi_start > CGI_TIMEOUT) {
-            std::cout << "CGI timeout: fd=" << it->first << std::endl;
-
             kill(client.cgi_pid, SIGKILL);
-            waitpid(client.cgi_pid, NULL, 0);
+            waitpid(client.cgi_pid, NULL, WNOHANG);
             client.cgi_pid     = -1;
             client.cgi_running = false;
 
@@ -473,17 +612,19 @@ void Server::checkTimeouts() {
                 _cgi_pipe_fds.erase(client.cgi_read_fd);
                 client.cgi_read_fd = -1;
             }
+            if (client.cgi_write_fd != -1) {
+                deleteEvent(client.cgi_write_fd, EVFILT_WRITE);
+                close(client.cgi_write_fd);
+                _cgi_write_fds.erase(client.cgi_write_fd);
+                client.cgi_write_fd = -1;
+            }
 
-            Response res;
-            res.status_code = 504;
-            res.status_msg  = "Gateway Timeout";
-            res.setBody("<html><body><h1>504 Gateway Timeout</h1></body></html>",
-                        "text/html");
-            res.setHeader("Connection", "close");
-            client.send_buffer = res.serialize();
+            std::string err = buildErrorResponse(client, "504 Gateway Timeout");
+            client.send_buffer.swap(err);
+            client.send_offset = 0;
             client.keep_alive  = false;
             client.request.reset();
-            client.parser = RequestParser();
+            client.parser.reset();
 
             try { addEvent(it->first, EVFILT_WRITE, EV_ADD); } catch (...) {}
             deleteEvent(it->first, EVFILT_READ);
@@ -494,13 +635,9 @@ void Server::checkTimeouts() {
             to_remove.push_back(it->first);
     }
 
-    for (size_t i = 0; i < to_remove.size(); i++) {
-        std::cout << "Timeout: fd=" << to_remove[i] << std::endl;
+    for (size_t i = 0; i < to_remove.size(); i++)
         removeClient(to_remove[i]);
-    }
 }
-
-// Hulpfuncties
 
 ServerConfig *Server::matchServer(int listen_fd) {
     std::map<int, int>::iterator it = _listen_fds.find(listen_fd);
@@ -529,13 +666,8 @@ std::string Server::buildErrorResponse(Client &client, const std::string &error_
         code = std::atoi(error_msg.substr(0, 3).c_str());
 
     ResponseBuilder builder;
-    Response res = builder.build(
-        client.request,
-        client.server ? *client.server : _configs[0],
-        NULL
-    );
-    res.status_code = code;
-    res.status_msg  = error_msg.size() > 4 ? error_msg.substr(4) : "Error";
-    res.setHeader("Connection", "close");
-    return res.serialize();
+    Response res = builder.serveErrorPage(
+        code, client.server ? *client.server : _configs[0]);
+    res.setHeader("Connection", client.keep_alive ? "keep-alive" : "close");
+    return res.serialize("GET");
 }
