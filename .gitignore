@@ -1,0 +1,21 @@
+# Build artifacts
+*.o
+*.obj
+*.d
+
+# Compiled binary
+webserv/webserv
+
+# OS clutter
+.DS_Store
+Thumbs.db
+
+# Editor files
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Test output
+/tmp/
