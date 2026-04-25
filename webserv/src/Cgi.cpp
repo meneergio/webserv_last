@@ -1,5 +1,5 @@
 #include "../include/Cgi.hpp"
-#include "../include/Response.hpp" 
+#include "../include/Response.hpp"
 #include <stdexcept>
 #include <sstream>
 #include <cstring>
@@ -8,6 +8,44 @@
 #include <sys/wait.h>
 #include <fcntl.h>
 #include <cerrno>
+
+// Pas een binary-pad aan zodat het na een chdir naar `script_dir` nog
+// correct verwijst naar dezelfde file.
+//
+// Voorbeeld: server cwd = X. Config zegt cgi binary = "./www/cgi-bin/foo".
+// Het script ligt op "./www/YoupiBanane/youpi.bla" en we willen chdirren
+// naar "./www/YoupiBanane" zodat de CGI relatieve files vindt.
+// Na chdir is de cwd diepte 2 onder X, dus "./www/cgi-bin/foo" wordt
+// "../../www/cgi-bin/foo".
+//
+// We gebruiken expres GEEN realpath/getcwd (niet in de toegelaten
+// functielijst van het subject). Voor absolute paden (zoals
+// "/usr/bin/python3") veranderen we niets.
+static std::string adjustBinaryForChdir(const std::string &binary,
+                                        const std::string &script_dir) {
+    if (binary.empty() || binary[0] == '/')
+        return binary;
+
+    std::string clean = script_dir;
+    if (clean.size() >= 2 && clean[0] == '.' && clean[1] == '/')
+        clean = clean.substr(2);
+    if (clean == "." || clean.empty())
+        return binary;
+
+    // Aantal directory-componenten in het chdir-pad
+    int depth = 1;
+    for (size_t i = 0; i < clean.size(); ++i)
+        if (clean[i] == '/') ++depth;
+
+    std::string prefix;
+    for (int i = 0; i < depth; ++i)
+        prefix += "../";
+
+    std::string b = binary;
+    if (b.size() >= 2 && b[0] == '.' && b[1] == '/')
+        b = b.substr(2);
+    return prefix + b;
+}
 
 CgiHandler::CgiHandler(const Request &req,
                        const Location &loc,
@@ -56,29 +94,44 @@ int CgiHandler::start(pid_t &out_pid, int &out_write_fd) {
         close(out_pipe[1]);
 
 
-        // Bouw paden zonder realpath/getcwd: we behouden de relatieve paden
-        // zoals geconfigureerd. Binary en script worden vanaf de cwd van de
-        // server gevonden. We chdirren NIET in deze child want dat zou de
-        // relatieve binary path breken; in plaats daarvan stellen we PWD
-        // expliciet zodat scripts hun eigen directory kennen.
-        const char *binary_path = _cgi.binary.c_str();
-        const char *script_path = _filepath.c_str();
+        // Verifieer eerst dat het binary bereikbaar is vanaf de huidige cwd.
+        // access() staat in de toegelaten functielijst van het subject.
+        if (access(_cgi.binary.c_str(), X_OK) != 0) {
+            write(STDOUT_FILENO, "Status: 500\r\n\r\n", 15);
+            exit(1);
+        }
+
+        // Bereken een binary-pad dat OOK na chdir naar de script-directory
+        // nog naar hetzelfde bestand wijst. Voor absolute paden is dit
+        // ongewijzigd; voor relatieve paden voegen we ../-prefixen toe.
+        std::string script_dir   = getScriptDir();
+        std::string adjusted_bin = adjustBinaryForChdir(_cgi.binary, script_dir);
+
+        // Het script-argument vereenvoudigen tot zijn basename: na chdir
+        // staan we al in zijn directory.
+        std::string adjusted_script = "./" + getScriptName();
+
+        // chdir naar de script-directory zodat de CGI relatieve file-access
+        // doet vanuit de script-locatie (zoals het subject vraagt).
+        // chdir mag falen als de directory niet bestaat — geen fout: dan
+        // executeren we vanaf de huidige cwd.
+        (void)chdir(script_dir.c_str());
 
         std::vector<std::string> env_vec = buildEnv();
         char **env = envToCharpp(env_vec);
 
         char *args[3];
-        args[0] = const_cast<char*>(binary_path);
+        args[0] = const_cast<char*>(adjusted_bin.c_str());
 
-        // Als binary == script (standalone CGI binary), geen argument meegeven
-        if (std::strcmp(binary_path, script_path) == 0) {
+        // Als binary == script (standalone CGI binary), geen argument meegeven.
+        if (std::strcmp(_cgi.binary.c_str(), _filepath.c_str()) == 0) {
             args[1] = NULL;
         } else {
-            args[1] = const_cast<char*>(script_path);
+            args[1] = const_cast<char*>(adjusted_script.c_str());
             args[2] = NULL;
         }
 
-        execve(binary_path, args, env);
+        execve(adjusted_bin.c_str(), args, env);
 
         freeCharpp(env);
         write(STDOUT_FILENO, "Status: 500\r\n\r\n", 15);
