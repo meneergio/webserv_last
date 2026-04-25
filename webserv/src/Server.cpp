@@ -11,6 +11,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <arpa/inet.h>
+#include <cctype>
+#include <stdint.h>
 #include <sys/event.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
@@ -20,6 +22,34 @@
 // Compact een rolling buffer pas wanneer de offset groter is dan deze waarde.
 // Vermijdt O(n^2) memmove door erase(0, n) op grote bodies.
 static const size_t COMPACT_THRESHOLD = 64 * 1024;
+
+// Parse "a.b.c.d" naar network-byte-order uint32_t.
+// Vervangt inet_pton (niet in de toegelaten functielijst van het subject).
+static bool parseIPv4(const std::string &s, uint32_t &out) {
+    uint32_t parts[4] = {0, 0, 0, 0};
+    int idx = 0;
+    size_t i = 0;
+    while (i < s.size() && idx < 4) {
+        if (!std::isdigit(static_cast<unsigned char>(s[i]))) return false;
+        uint32_t val = 0;
+        size_t digits = 0;
+        while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i]))) {
+            val = val * 10 + static_cast<uint32_t>(s[i] - '0');
+            if (val > 255) return false;
+            i++;
+            digits++;
+            if (digits > 3) return false;
+        }
+        parts[idx++] = val;
+        if (i < s.size()) {
+            if (s[i] != '.') return false;
+            i++;
+        }
+    }
+    if (idx != 4 || i != s.size()) return false;
+    out = htonl((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]);
+    return true;
+}
 
 Server::Server(std::vector<ServerConfig> &configs)
     : _configs(configs)
@@ -97,10 +127,12 @@ int Server::createSocket(const ServerConfig &config) {
     if (config.host == "0.0.0.0" || config.host.empty()) {
         addr.sin_addr.s_addr = INADDR_ANY;
     } else {
-        if (inet_pton(AF_INET, config.host.c_str(), &addr.sin_addr) != 1) {
+        uint32_t v4;
+        if (!parseIPv4(config.host, v4)) {
             close(fd);
             throw std::runtime_error("Invalid host address: " + config.host);
         }
+        addr.sin_addr.s_addr = v4;
     }
 
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) == -1) {

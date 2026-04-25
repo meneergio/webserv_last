@@ -56,42 +56,29 @@ int CgiHandler::start(pid_t &out_pid, int &out_write_fd) {
         close(out_pipe[1]);
 
 
-        // Resolve het CGI binary pad (dat MOET bestaan)
-        char abs_binary[4096];
-        if (realpath(_cgi.binary.c_str(), abs_binary) == NULL) {
-            write(STDOUT_FILENO, "Status: 500\r\n\r\n", 15);
-            exit(1);
-        }
-
-        // Voor het script pad: als het bestaat gebruiken we absolute, anders relatief
-        char abs_path[4096];
-        bool script_exists = (realpath(_filepath.c_str(), abs_path) != NULL);
-        if (!script_exists) {
-            // Bestand bestaat niet, maar dat is OK voor sommige CGI binaries.
-            // Kopieer gewoon het originele pad.
-            std::strncpy(abs_path, _filepath.c_str(), sizeof(abs_path) - 1);
-            abs_path[sizeof(abs_path) - 1] = '\0';
-        }
-
-        std::string dir = getScriptDir();
-        // chdir mag falen (als de directory niet bestaat), dat is geen fout.
-        (void)chdir(dir.c_str());
+        // Bouw paden zonder realpath/getcwd: we behouden de relatieve paden
+        // zoals geconfigureerd. Binary en script worden vanaf de cwd van de
+        // server gevonden. We chdirren NIET in deze child want dat zou de
+        // relatieve binary path breken; in plaats daarvan stellen we PWD
+        // expliciet zodat scripts hun eigen directory kennen.
+        const char *binary_path = _cgi.binary.c_str();
+        const char *script_path = _filepath.c_str();
 
         std::vector<std::string> env_vec = buildEnv();
         char **env = envToCharpp(env_vec);
 
         char *args[3];
-        args[0] = abs_binary;
+        args[0] = const_cast<char*>(binary_path);
 
         // Als binary == script (standalone CGI binary), geen argument meegeven
-        if (std::strcmp(abs_binary, abs_path) == 0) {
+        if (std::strcmp(binary_path, script_path) == 0) {
             args[1] = NULL;
         } else {
-            args[1] = abs_path;
+            args[1] = const_cast<char*>(script_path);
             args[2] = NULL;
         }
 
-        execve(abs_binary, args, env);
+        execve(binary_path, args, env);
 
         freeCharpp(env);
         write(STDOUT_FILENO, "Status: 500\r\n\r\n", 15);
