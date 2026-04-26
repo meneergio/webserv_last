@@ -178,11 +178,10 @@ Response CgiHandler::parseCgiOutput(const std::string &raw_output,
     res.status_msg  = "OK";
 
     if (raw_output.empty()) {
-        res.status_code = 500;
-        res.status_msg  = "Internal Server Error";
-        res.setBody("<html><body><h1>CGI produced no output</h1></body></html>",
-                    "text/html");
-        return res;
+        // Geen output van CGI — gebruik de geconfigureerde 500 error page
+        // zodat de site-eigen styling consistent blijft.
+        ResponseBuilder builder;
+        return builder.serveErrorPage(500, server);
     }
 
     // Zoek scheiding tussen headers en body
@@ -236,7 +235,6 @@ Response CgiHandler::parseCgiOutput(const std::string &raw_output,
     if (res.headers.find("Content-Type") == res.headers.end())
         res.headers["Content-Type"] = "text/html";
 
-    (void)server;
     return res;
 }
 
