@@ -15,8 +15,8 @@
 #endif
 
 #define MAX_EVENTS  64
-#define TIMEOUT_SEC 120  // client timeout in seconden
-#define CGI_TIMEOUT 120   // CGI timeout in seconden
+#define TIMEOUT_SEC 600  // client idle timeout in seconden
+#define CGI_TIMEOUT 600  // CGI timeout in seconden — ruim genoeg voor 20x parallel 100MB POSTs
 
 // Ruwe request/response buffers per client
 struct Client {
