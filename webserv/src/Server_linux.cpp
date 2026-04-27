@@ -512,6 +512,7 @@ void Server::handleCgiWrite(int write_fd) {
                           remaining);
     if (bytes > 0) {
         client.cgi_body_offset += bytes;
+        client.last_activity = time(NULL);
         if (client.cgi_body_offset >= client.cgi_body.size() && !client.cgi_streaming) {
             epoll_ctl(_kq, EPOLL_CTL_DEL, write_fd, NULL);
             close(write_fd);

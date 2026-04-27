@@ -515,6 +515,7 @@ void Server::handleCgiWrite(int write_fd) {
                           remaining);
     if (bytes > 0) {
         client.cgi_body_offset += bytes;
+        client.last_activity = time(NULL);
         if (client.cgi_body_offset >= client.cgi_body.size() && !client.cgi_streaming) {
             deleteEvent(write_fd, EVFILT_WRITE);
             close(write_fd);
