@@ -171,6 +171,27 @@ int CgiHandler::start(pid_t &out_pid, int &out_write_fd) {
 // parseCgiOutput(): parset ruwe CGI stdout naar een Response
 // Formaat: headers\r\n\r\nbody  of  headers\n\nbody
 
+// Zet een header-naam om naar Title-Case-With-Hyphens (b.v. "content-type" en
+// "Content-type" worden allebei "Content-Type"). Voorkomt dat we dezelfde
+// header twee keer in de response zetten als de CGI een afwijkende casing
+// gebruikt (PHP-CGI schrijft "Content-type"; onze default is "Content-Type").
+static std::string canonicalizeHeader(const std::string &name) {
+    std::string out;
+    out.reserve(name.size());
+    bool start_of_word = true;
+    for (size_t i = 0; i < name.size(); ++i) {
+        char c = name[i];
+        if (start_of_word && std::isalpha(static_cast<unsigned char>(c)))
+            out += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        else if (std::isalpha(static_cast<unsigned char>(c)))
+            out += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        else
+            out += c;
+        start_of_word = (c == '-');
+    }
+    return out;
+}
+
 Response CgiHandler::parseCgiOutput(const std::string &raw_output,
                                     const ServerConfig &server) {
     Response res;
@@ -215,7 +236,9 @@ Response CgiHandler::parseCgiOutput(const std::string &raw_output,
         if (!value.empty() && value[0] == ' ')
             value.erase(0, 1);
 
-        if (key == "Status") {
+        std::string canonical_key = canonicalizeHeader(key);
+
+        if (canonical_key == "Status") {
             res.status_code = std::atoi(value.c_str());
             // Probeer de status message uit het value te halen (bv. "404 Not Found")
             size_t sp = value.find(' ');
@@ -227,7 +250,9 @@ Response CgiHandler::parseCgiOutput(const std::string &raw_output,
                 res.status_msg = rb.getStatusMessage(res.status_code);
             }
         } else {
-            res.headers[key] = value;
+            // Sla op met canonieke key zodat "Content-type" en "Content-Type"
+            // dezelfde slot in de map gebruiken.
+            res.headers[canonical_key] = value;
         }
     }
 
