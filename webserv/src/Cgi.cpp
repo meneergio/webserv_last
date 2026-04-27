@@ -245,8 +245,12 @@ std::vector<std::string> CgiHandler::buildEnv() const {
 
     env.push_back("REQUEST_METHOD=" + _req.method);
     env.push_back("QUERY_STRING=" + _req.query);
-    env.push_back("SCRIPT_FILENAME=" + _filepath);
-    // SCRIPT_NAME weggelaten - veroorzaakt PATH_INFO incorrect error met cgi_tester
+    // We chdirren naar de script-directory in start(), dus SCRIPT_FILENAME
+    // moet daar relatief tegen zijn (anders zoekt php-cgi op de verkeerde
+    // plek en geeft "No input file specified.").
+    env.push_back("SCRIPT_FILENAME=./" + getScriptName());
+    // SCRIPT_NAME bewust weggelaten - veroorzaakt PATH_INFO incorrect error
+    // bij cgi_tester. PHP-CGI heeft alleen SCRIPT_FILENAME nodig.
     env.push_back("PATH_INFO=" + _req.uri);
     env.push_back("SERVER_PROTOCOL=" + _req.version);
     env.push_back("SERVER_SOFTWARE=webserv/1.0");
